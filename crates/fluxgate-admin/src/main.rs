@@ -32,6 +32,7 @@ mod serve;
 mod state;
 mod tls;
 mod waf;
+mod waf_packs;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -217,6 +218,7 @@ fn build_router(state: AppState) -> Router {
         // deliberately NOT recorded into the access-log / WAF / in-flight
         // metrics, which belong to the data plane (the reverse proxy). Mixing
         // them polluted dashboards (admin polling showed up as proxy traffic).
+        .layer(axum::middleware::map_response(proxy::set_server_header))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
 }

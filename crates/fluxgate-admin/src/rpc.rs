@@ -108,6 +108,11 @@ pub async fn handle_rpc(
             if is_mutation(&method) {
                 let store = state.store.lock();
                 crate::persist::save(&state.config.data_path, &store);
+                // Recompile the WAF rule set when rules changed (keeps the
+                // lock-free hot-path snapshot current).
+                if method.starts_with("waf.rule") {
+                    state.waf.rebuild(&store.waf_rules);
+                }
             }
             Json(success_response(id, result))
         }
@@ -137,7 +142,15 @@ fn is_mutation(method: &str) -> bool {
     matches!(
         method.rsplit('.').next(),
         Some(
-            "create" | "update" | "delete" | "enable" | "disable" | "request" | "renew" | "upload"
+            "create"
+                | "update"
+                | "delete"
+                | "enable"
+                | "disable"
+                | "request"
+                | "renew"
+                | "upload"
+                | "import"
         )
     ) || method == "settings.update"
         || method == "auth.change_password"
@@ -463,6 +476,40 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 .ok_or_else(|| RpcError::not_found(format!("upstream {}", p.id)))?;
             collector::probe_one_upstream(u);
             ok(u.clone())
+        }
+
+        // ---- WAF rule packs (bundled open-source rulesets) ----
+        "waf.pack.list" => ok(crate::waf_packs::packs()
+            .iter()
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "name": p.name,
+                    "description": p.description,
+                    "rule_count": (p.rules)().len(),
+                })
+            })
+            .collect::<Vec<_>>()),
+        "waf.rule.import" => {
+            #[derive(Deserialize)]
+            struct ImportParams {
+                pack: String,
+            }
+            let p: ImportParams = parse(params)?;
+            let pack = crate::waf_packs::pack_rules(&p.pack)
+                .ok_or_else(|| RpcError::not_found(format!("rule pack {}", p.pack)))?;
+            // Additive + idempotent: skip rules already present (by id).
+            let known: std::collections::HashSet<String> =
+                store.waf_rules.iter().map(|r| r.id.clone()).collect();
+            let mut imported = 0u32;
+            for rule in pack {
+                if !known.contains(&rule.id) {
+                    store.waf_rules.push(rule);
+                    imported += 1;
+                }
+            }
+            audit("waf.rule.import", &p.pack);
+            ok(json!({ "imported": imported, "pack": p.pack }))
         }
 
         // ---- WAF rules ----

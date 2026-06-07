@@ -83,9 +83,26 @@ impl AppState {
                 Err(e) => tracing::warn!("could not seed default certificate: {e}"),
             }
         }
+        // Add any newly-shipped built-in WAF rules (matched by id) that aren't
+        // present yet, so upgrades pick up new baseline protections without
+        // clobbering the operator's edits or custom rules.
+        let known: std::collections::HashSet<String> =
+            store.waf_rules.iter().map(|r| r.id.clone()).collect();
+        let new_rules: Vec<_> = crate::persist::default_waf_rules()
+            .into_iter()
+            .filter(|r| !known.contains(&r.id))
+            .collect();
+        if !new_rules.is_empty() {
+            tracing::info!("added {} new built-in WAF rule(s)", new_rules.len());
+            store.waf_rules.extend(new_rules);
+            dirty = true;
+        }
         if dirty {
             crate::persist::save(&config.data_path, &store);
         }
+        // Compile the WAF rules once up front (priority-sorted, regexes built).
+        let waf = Arc::new(WafEngine::new());
+        waf.rebuild(&store.waf_rules);
         // Capture buffer paths before `config` is moved into the Arc.
         let log_path = config.log_path.clone();
         let event_path = config.event_path.clone();
@@ -94,7 +111,7 @@ impl AppState {
             store: Arc::new(Mutex::new(store)),
             telemetry: Arc::new(Mutex::new(Telemetry::new())),
             logs: Arc::new(Mutex::new(LogBuffer::new(1000, log_path))),
-            waf: Arc::new(WafEngine::new()),
+            waf,
             waf_events: Arc::new(Mutex::new(EventBuffer::new(500, event_path))),
             inflight: Arc::new(AtomicI64::new(0)),
             proxy_client: Arc::new(crate::proxy::build_client()),

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { createColumnHelper } from '@tanstack/react-table'
-import { Plus, Pencil, Trash2 } from 'lucide-react'
+import { Plus, Pencil, Trash2, DownloadCloud } from 'lucide-react'
 import { useRpc } from '@/hooks/useRpc'
 import { rpc } from '@/api/rpc'
 import { useToast } from '@/context/ToastContext'
@@ -42,11 +42,24 @@ export function WafRulesPage() {
   const { t } = useI18n()
   const { data, loading, error, refetch } = useRpc<WafRule[]>('waf.rule.list')
   const events = useRpc<SecurityEvent[]>('waf.event.list', { limit: 8 })
+  const packs = useRpc<{ id: string; name: string; description: string; rule_count: number }[]>('waf.pack.list')
 
   const [formOpen, setFormOpen] = useState(false)
   const [form, setForm] = useState<WafForm>(emptyForm)
   const [saving, setSaving] = useState(false)
   const [toDelete, setToDelete] = useState<WafRule | null>(null)
+  const [importOpen, setImportOpen] = useState(false)
+
+  const crs = packs.data?.find((p) => p.id === 'owasp-crs')
+  const importPack = async () => {
+    try {
+      const r = await rpc.call<{ imported: number }>('waf.rule.import', { pack: 'owasp-crs' })
+      toast.success(t('waf.imported', { n: String(r.imported) }))
+      refetch()
+    } catch (e: any) {
+      toast.error(t('toast.saveFailed'), e?.message)
+    }
+  }
 
   const openCreate = () => {
     setForm(emptyForm)
@@ -146,7 +159,12 @@ export function WafRulesPage() {
       <PageHeader
         title={t('waf.title')}
         description={t('waf.desc')}
-        actions={<Button icon={<Plus size={16} />} onClick={openCreate}>{t('waf.new')}</Button>}
+        actions={
+          <>
+            <Button variant="secondary" icon={<DownloadCloud size={16} />} onClick={() => setImportOpen(true)}>{t('waf.importPack')}</Button>
+            <Button icon={<Plus size={16} />} onClick={openCreate}>{t('waf.new')}</Button>
+          </>
+        }
       />
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
@@ -236,6 +254,15 @@ export function WafRulesPage() {
         title={t('waf.deleteTitle')}
         confirmLabel={t('common.delete')}
         message={t('waf.deleteMsg', { name: toDelete?.name ?? '' })}
+      />
+
+      <ConfirmDialog
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onConfirm={importPack}
+        title={t('waf.importTitle')}
+        confirmLabel={t('waf.importConfirm')}
+        message={t('waf.importMsg', { name: crs?.name ?? 'OWASP CRS', n: String(crs?.rule_count ?? 0) })}
       />
     </div>
   )

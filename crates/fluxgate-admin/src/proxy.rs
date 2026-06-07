@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, HeaderName, Method, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Router,
 };
@@ -75,10 +75,23 @@ impl Drop for InflightGuard {
     }
 }
 
+/// `Server` header advertised on every response we serve.
+const SERVER_HEADER: HeaderValue = HeaderValue::from_static("FluxGate/1.0");
+
+/// Response middleware: stamp our `Server` header, replacing any value the
+/// upstream sent (also avoids leaking the backend's server identity).
+pub async fn set_server_header(mut res: Response) -> Response {
+    res.headers_mut().insert(header::SERVER, SERVER_HEADER);
+    res
+}
+
 /// Build the reverse-proxy data-plane router (shared by the plaintext and TLS
 /// listeners).
 pub fn router(state: AppState) -> Router {
-    Router::new().fallback(proxy_handler).with_state(state)
+    Router::new()
+        .fallback(proxy_handler)
+        .layer(axum::middleware::map_response(set_server_header))
+        .with_state(state)
 }
 
 pub async fn run(state: AppState, addr: SocketAddr) -> std::io::Result<()> {
@@ -190,19 +203,18 @@ async fn proxy_handler(
                     .map(|s| (k.as_str().to_lowercase(), s.to_string()))
             })
             .collect();
-        let decision = {
-            let store = state.store.lock();
-            let default = store.settings.default_waf_action;
-            let now_sec = Utc::now().timestamp().max(0) as u64;
-            let ctx = WafContext {
-                client_ip: &client_ip,
-                method: method.as_str(),
-                path: &path,
-                headers: &lc_headers,
-            };
-            // evaluate() counts the hit engine-side; no Store write on the hot path.
-            state.waf.evaluate(&store.waf_rules, default, &ctx, now_sec)
+        // Only the default action needs the Store (brief lock); rule evaluation
+        // runs against the WAF engine's own lock-free compiled snapshot.
+        let default = state.store.lock().settings.default_waf_action;
+        let now_sec = Utc::now().timestamp().max(0) as u64;
+        let ctx = WafContext {
+            client_ip: &client_ip,
+            method: method.as_str(),
+            // Inspect path + query so injection in query params is caught.
+            path: &path_and_query,
+            headers: &lc_headers,
         };
+        let decision = state.waf.evaluate(default, &ctx, now_sec);
         if decision.action != WafAction::Allow {
             let (status, msg) = match decision.action {
                 WafAction::Deny => (StatusCode::FORBIDDEN, "Forbidden by WAF"),

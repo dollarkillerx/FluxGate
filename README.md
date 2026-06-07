@@ -295,6 +295,43 @@ typecheck/build on every push and PR.
 
 ---
 
+## Performance
+
+Measured on a release build (`cargo build --release`), single host.
+
+**WAF — lock-free, pre-compiled rule set.** Rules are compiled once (regexes
+built, CIDRs parsed, priority-sorted) into an immutable snapshot read through an
+`Arc`; the request path does no allocation, no sort, and no regex compilation.
+Microbenchmark over the **full baseline + OWASP CRS pack (32 regex/IP rules)**
+(`cargo test --release -- --ignored bench_evaluate`):
+
+| Case | Cost | Throughput / core |
+| ---- | ---- | ----------------- |
+| Benign (every rule evaluated) | ~440 ns/req | ~2.3M req/s |
+| Attack (early match) | ~210 ns/req | ~4.7M req/s |
+
+End-to-end (`ab -k -c50`, same backend), WAF **off vs on** was within noise
+(~25k req/s both, 0 failures) — the sub-microsecond WAF cost is dwarfed by
+network + backend latency (the ~25k ceiling there was the test backend, not the
+proxy). Note: the built-in `2000 r/s` rate-limit rule legitimately throttles a
+single-IP flood, so disable rate-limit rules before micro-measuring CPU cost.
+
+**Other hot-path work is already minimized:** access-log/metric timestamps are
+parsed once (no per-poll re-parse or full-buffer clone); the SNI resolver caches
+parsed certificates per version (no disk read/parse per handshake); access/event
+logs use a long-lived `O_APPEND` handle (no `open()` per request); shared state
+uses `parking_lot` mutexes (no poisoning); WAF hit counters live in the engine
+(no Store write on the hot path); and admin-console requests are kept out of the
+proxy's metrics/logs entirely.
+
+**Known ceiling.** A single config mutex still guards routing (`pick_target`
+locks it once per request), control-plane reads, and persistence (which
+serializes the whole store under the lock). Under high concurrency this is the
+throughput ceiling; publishing an `arc-swap` routing snapshot for lock-free
+data-plane reads is the next optimization.
+
+---
+
 ## Notes & roadmap
 
 - **Concurrency:** shared state uses `parking_lot` mutexes (no poisoning). The

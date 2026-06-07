@@ -153,86 +153,171 @@ pub fn default_waf_rules() -> Vec<WafRule> {
         enabled,
         hit_count: 0,
     };
+    use WafAction::{Challenge, Deny};
+    use WafMatchType::{Geo, Header, Method, Path, RateLimit};
+    // Path rules match the decoded path **and query**, so encoded payloads
+    // (%2e%2e, %20) are normalized first. Lower priority = evaluated earlier.
     vec![
         mk(
             "waf-default-methods",
             "Block dangerous HTTP methods",
-            "Deny TRACE / TRACK / CONNECT which are rarely legitimate.",
-            WafMatchType::Method,
-            r"^(TRACE|TRACK|CONNECT)$",
-            WafAction::Deny,
+            "Deny TRACE / TRACK / CONNECT / DEBUG which are rarely legitimate.",
+            Method,
+            r"(?i)^(TRACE|TRACK|CONNECT|DEBUG)$",
+            Deny,
             5,
             true,
         ),
         mk(
-            "waf-default-sqli",
-            "Block SQL injection",
-            "Common SQLi signatures in the request path/query.",
-            WafMatchType::Path,
-            r"(?i)(\bunion\b.+\bselect\b|\bor\b\s+1\s*=\s*1|';\s*--|/\*.+\*/)",
-            WafAction::Deny,
-            10,
+            "waf-default-jndi",
+            "Block Log4Shell (JNDI)",
+            "CVE-2021-44228 — ${jndi:ldap/rmi/dns://…} lookups in the request target.",
+            Path,
+            r"(?i)\$\{jndi:(ldap|ldaps|rmi|dns|nis|iiop|corba|nds|http)://",
+            Deny,
+            6,
             true,
         ),
         mk(
-            "waf-default-traversal",
-            "Block path traversal",
-            "Directory traversal and access to sensitive system files.",
-            WafMatchType::Path,
-            r"(?i)(\.\./|\.\.\\|/etc/passwd|/proc/self|c:\\windows)",
-            WafAction::Deny,
-            11,
-            true,
-        ),
-        mk(
-            "waf-default-xss",
-            "Block reflected XSS",
-            "Script / event-handler injection attempts in the URL.",
-            WafMatchType::Path,
-            r"(?i)(<script|javascript:|onerror\s*=|onload\s*=)",
-            WafAction::Deny,
-            12,
-            true,
-        ),
-        mk(
-            "waf-default-sensitive-files",
-            "Block sensitive files",
-            "Requests for dotfiles / backups that should never be public.",
-            WafMatchType::Path,
-            r"(?i)\.(env|git|htaccess|bak|sql|pem|key)(/|$|\?)",
-            WafAction::Deny,
-            13,
-            true,
-        ),
-        mk(
-            "waf-default-empty-ua",
-            "Challenge empty User-Agent",
-            "JS challenge for requests with a missing/blank User-Agent.",
-            WafMatchType::Header,
-            r"User-Agent: ^\s*$",
-            WafAction::Challenge,
-            30,
-            true,
-        ),
-        mk(
-            "waf-default-ratelimit",
-            "Global rate limit",
-            "Challenge clients exceeding 1000 requests/second across all paths.",
-            WafMatchType::RateLimit,
-            "/@1000r/s",
-            WafAction::Challenge,
-            40,
+            "waf-default-jndi-ua",
+            "Block Log4Shell in User-Agent",
+            "A JNDI lookup string smuggled through the User-Agent header.",
+            Header,
+            r"User-Agent: (?i)\$\{jndi:",
+            Deny,
+            7,
             true,
         ),
         mk(
             "waf-default-geo",
             "Geo block (template)",
             "Example GeoIP rule — requires a GeoIP database to take effect; disabled by default.",
-            WafMatchType::Geo,
+            Geo,
             "country in [KP, SY]",
-            WafAction::Deny,
+            Deny,
             8,
             false,
+        ),
+        mk(
+            "waf-default-sqli",
+            "Block SQL injection",
+            "UNION SELECT, boolean (or/and N=N), comments, stacked queries, \
+             sleep/benchmark, INTO OUTFILE, information_schema, xp_cmdshell.",
+            Path,
+            r"(?i)(\bunion\b\s+(all\s+)?\bselect\b|\b(or|and)\b\s+\d+\s*=\s*\d+|';\s*(--|#)|/\*.*\*/|\b(sleep|benchmark|pg_sleep)\s*\(|\bwaitfor\s+delay\b|\binto\s+(outfile|dumpfile)\b|\bload_file\s*\(|\binformation_schema\b|\bxp_cmdshell\b)",
+            Deny,
+            10,
+            true,
+        ),
+        mk(
+            "waf-default-nosqli",
+            "Block NoSQL injection",
+            "MongoDB-style operator injection ($ne / $gt / $where / …).",
+            Path,
+            r"(?i)(\[\$(ne|gt|lt|gte|lte|in|nin|regex|where|exists|or|and)\]|\$where\s*:|\bfunction\s*\(\s*\)\s*\{)",
+            Deny,
+            11,
+            true,
+        ),
+        mk(
+            "waf-default-traversal",
+            "Block path traversal / LFI",
+            "Directory traversal, sensitive system files, and PHP/file wrappers.",
+            Path,
+            r"(?i)(\.\./|\.\.\\|/etc/(passwd|shadow|hosts|group)|/proc/self/|/windows/win\.ini|c:\\windows|php://(filter|input)|file://|expect://|data://text)",
+            Deny,
+            12,
+            true,
+        ),
+        mk(
+            "waf-default-rce",
+            "Block command injection",
+            "Shell metacharacters with common commands, $(...) and `...` substitution.",
+            Path,
+            r"(?i)([;|]\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|powershell|python)\b|&&\s*(cat|ls|id|wget|curl|nc)\b|\$\([^)]*\)|`[^`]*`|/bin/(ba)?sh\b|\bnc\s+-e\b)",
+            Deny,
+            13,
+            true,
+        ),
+        mk(
+            "waf-default-xss",
+            "Block reflected XSS",
+            "Script / event-handler / SVG / iframe injection and common XSS sinks.",
+            Path,
+            r"(?i)(<script[\s/>]|</script>|javascript:|vbscript:|\bon(error|load|click|mouseover|focus|toggle|animationstart)\s*=|<svg[\s/>]|<iframe[\s>]|<img[^>]+\bsrc\b|document\.cookie|\balert\s*\(|String\.fromCharCode)",
+            Deny,
+            14,
+            true,
+        ),
+        mk(
+            "waf-default-crlf",
+            "Block CRLF / response splitting",
+            "Carriage-return/line-feed header injection (decoded %0d%0a).",
+            Path,
+            r"(?i)(\r\n|\n)\s*(set-cookie|location|content-length|content-type)\s*:",
+            Deny,
+            15,
+            true,
+        ),
+        mk(
+            "waf-default-sensitive-files",
+            "Block sensitive files",
+            "Dotfiles, secrets, backups and config files that should never be public.",
+            Path,
+            r"(?i)(/\.(env|git|svn|hg|htaccess|htpasswd|aws|ssh|bash_history|npmrc|dockercfg)\b|/\.git/|\.(bak|backup|old|orig|swp|sql|sqlite|db|pem|key|p12|pfx)(\?|$)|/(wp-config|web|app|settings|configuration)\.(php|config|xml|yml|yaml)(\?|$)|/(id_rsa|id_dsa|authorized_keys)\b)",
+            Deny,
+            16,
+            true,
+        ),
+        mk(
+            "waf-default-webshell",
+            "Block web shells",
+            "Requests for known web-shell / backdoor filenames.",
+            Path,
+            r"(?i)/(c99|r57|c100|wso|b374k|webshell|backdoor|adminer)\.(php|phtml|asp|aspx|jsp|jspx)(\?|$)",
+            Deny,
+            17,
+            true,
+        ),
+        mk(
+            "waf-default-scanner-ua",
+            "Block scanner / attack tools",
+            "User-Agents of common vulnerability scanners and attack tools.",
+            Header,
+            r"User-Agent: (?i)\b(sqlmap|nikto|nmap|masscan|nessus|acunetix|netsparker|dirbuster|gobuster|feroxbuster|wpscan|hydra|fimap|joomscan|wfuzz|nuclei|zgrab|httrack)\b",
+            Deny,
+            20,
+            true,
+        ),
+        mk(
+            "waf-default-empty-ua",
+            "Challenge empty User-Agent",
+            "JS challenge for requests with a missing/blank User-Agent.",
+            Header,
+            r"User-Agent: ^\s*$",
+            Challenge,
+            30,
+            true,
+        ),
+        mk(
+            "waf-default-login-ratelimit",
+            "Rate-limit auth endpoints",
+            "Challenge clients exceeding 10 req/s to /login (credential stuffing).",
+            RateLimit,
+            "/login@10r/s",
+            Challenge,
+            35,
+            true,
+        ),
+        mk(
+            "waf-default-ratelimit",
+            "Global rate limit",
+            "Challenge clients exceeding 2000 requests/second across all paths.",
+            RateLimit,
+            "/@2000r/s",
+            Challenge,
+            40,
+            true,
         ),
     ]
 }
@@ -291,6 +376,35 @@ mod tests {
         assert_eq!(ids.len(), rules.len());
         // All hit counts start at zero.
         assert!(rules.iter().all(|r| r.hit_count == 0));
+    }
+
+    /// Every shipped rule's regex must compile — an invalid pattern would
+    /// silently never match (a security hole), so fail the build instead.
+    #[test]
+    fn default_rule_patterns_compile() {
+        for r in default_waf_rules() {
+            match r.match_type {
+                WafMatchType::Path | WafMatchType::Method => {
+                    regex::Regex::new(&r.pattern)
+                        .unwrap_or_else(|e| panic!("rule {} bad regex: {e}", r.id));
+                }
+                WafMatchType::Header => {
+                    let (_name, pat) = r.pattern.split_once(':').unwrap_or_else(|| {
+                        panic!("rule {} header pattern needs 'Name: regex'", r.id)
+                    });
+                    regex::Regex::new(pat.trim())
+                        .unwrap_or_else(|e| panic!("rule {} bad header regex: {e}", r.id));
+                }
+                WafMatchType::RateLimit => {
+                    let (_prefix, spec) = r.pattern.split_once('@').unwrap_or_else(|| {
+                        panic!("rule {} rate pattern needs 'prefix@Nr/s'", r.id)
+                    });
+                    let n: u32 = spec.trim().trim_end_matches("r/s").trim().parse().unwrap();
+                    assert!(n > 0, "rule {} rate limit must be > 0", r.id);
+                }
+                WafMatchType::Ip | WafMatchType::Geo => {}
+            }
+        }
     }
 
     #[test]
