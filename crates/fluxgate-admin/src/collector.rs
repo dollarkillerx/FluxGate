@@ -34,6 +34,21 @@ fn open_append(path: &PathBuf) -> Option<std::fs::File> {
         .ok()
 }
 
+/// Warn the first time a JSONL persistence write fails (and again only after it
+/// recovers), so a full / read-only disk is surfaced without spamming per-line.
+/// Returns the new "write ok" state.
+fn warn_on_log_write(what: &str, res: std::io::Result<()>, was_ok: bool) -> bool {
+    match res {
+        Ok(()) => true,
+        Err(e) => {
+            if was_ok {
+                tracing::warn!("{what} persistence write failed: {e}");
+            }
+            false
+        }
+    }
+}
+
 /// Read a JSONL file → (total line count, last `cap` parsed, newest-first).
 fn load_jsonl<T: serde::de::DeserializeOwned>(path: &PathBuf, cap: usize) -> (u64, VecDeque<T>) {
     let mut entries = VecDeque::new();
@@ -181,6 +196,7 @@ pub struct LogBuffer {
     cap: usize,
     path: Option<PathBuf>,
     file: Option<std::fs::File>, // long-lived O_APPEND handle
+    write_ok: bool,              // false after a write failed (warn once per streak)
 }
 
 impl LogBuffer {
@@ -197,6 +213,7 @@ impl LogBuffer {
             cap,
             path,
             file,
+            write_ok: true,
         }
     }
 
@@ -204,7 +221,8 @@ impl LogBuffer {
         self.total += 1;
         if let Some(f) = self.file.as_mut() {
             if let Ok(line) = serde_json::to_string(&entry) {
-                let _ = writeln!(f, "{line}");
+                let res = writeln!(f, "{line}");
+                self.write_ok = warn_on_log_write("access-log", res, self.write_ok);
             }
         }
         self.entries.push_front(entry);
@@ -286,6 +304,7 @@ pub struct EventBuffer {
     cap: usize,
     path: Option<PathBuf>,
     file: Option<std::fs::File>, // long-lived O_APPEND handle
+    write_ok: bool,
 }
 
 impl EventBuffer {
@@ -319,6 +338,7 @@ impl EventBuffer {
             cap,
             path,
             file,
+            write_ok: true,
         }
     }
 
@@ -330,7 +350,8 @@ impl EventBuffer {
         }
         if let Some(f) = self.file.as_mut() {
             if let Ok(line) = serde_json::to_string(&event) {
-                let _ = writeln!(f, "{line}");
+                let res = writeln!(f, "{line}");
+                self.write_ok = warn_on_log_write("waf-event", res, self.write_ok);
             }
         }
         self.entries.push_front(event);
@@ -402,9 +423,11 @@ fn bucket_last_24m<T>(
     buckets
 }
 
-/// Labels matching `bucket_last_24m` order: "-23m" … "-0m".
-fn bucket_labels() -> Vec<String> {
-    (0..24).rev().map(|i| format!("-{}m", i)).collect()
+/// Labels matching `bucket_last_24m` order: "-23m" … "-0m". Built once and
+/// reused — they're constant, and several polled metric endpoints ask for them.
+fn bucket_labels() -> &'static [String] {
+    static LABELS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LABELS.get_or_init(|| (0..24).rev().map(|i| format!("-{}m", i)).collect())
 }
 
 pub fn dashboard_summary(
@@ -489,10 +512,10 @@ pub fn metrics_traffic(logs: &LogBuffer) -> Vec<MetricSeries> {
     let buckets = bucket_last_24m(logs.entries(), now, |l| l.time.as_str(), |_| true);
     let labels = bucket_labels();
 
-    let qps = series_from(&labels, &buckets, |b| b.len() as f64 / 60.0);
-    let p50 = series_from(&labels, &buckets, |b| latency_pct(b, 0.50));
-    let p99 = series_from(&labels, &buckets, |b| latency_pct(b, 0.99));
-    let err = series_from(&labels, &buckets, |b| {
+    let qps = series_from(labels, &buckets, |b| b.len() as f64 / 60.0);
+    let p50 = series_from(labels, &buckets, |b| latency_pct(b, 0.50));
+    let p99 = series_from(labels, &buckets, |b| latency_pct(b, 0.99));
+    let err = series_from(labels, &buckets, |b| {
         if b.is_empty() {
             0.0
         } else {
@@ -578,10 +601,10 @@ pub fn metrics_route(logs: &LogBuffer, host: &str, path: &str) -> Vec<MetricSeri
     );
     let labels = bucket_labels();
 
-    let qps = series_from(&labels, &buckets, |b| b.len() as f64 / 60.0);
-    let p50 = series_from(&labels, &buckets, |b| latency_pct(b, 0.50));
-    let p99 = series_from(&labels, &buckets, |b| latency_pct(b, 0.99));
-    let err = series_from(&labels, &buckets, |b| {
+    let qps = series_from(labels, &buckets, |b| b.len() as f64 / 60.0);
+    let p50 = series_from(labels, &buckets, |b| latency_pct(b, 0.50));
+    let p99 = series_from(labels, &buckets, |b| latency_pct(b, 0.99));
+    let err = series_from(labels, &buckets, |b| {
         if b.is_empty() {
             0.0
         } else {

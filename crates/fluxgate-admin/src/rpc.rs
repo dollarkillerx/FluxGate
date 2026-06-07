@@ -652,21 +652,17 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
         "tls.cert.renew" => {
             // Re-issue a fresh real keypair/cert for the same domain.
             let p: IdParam = parse(params)?;
-            let domain = store
-                .certs
-                .iter()
-                .find(|c| c.id == p.id)
-                .map(|c| c.domain.clone())
-                .ok_or_else(|| RpcError::not_found(format!("certificate {}", p.id)))?;
-            let (cert_pem, key_pem, expires) = crate::tls::generate_self_signed(&domain, 90)
-                .map_err(|e| RpcError::new(-32603, format!("renewal failed: {e}")))?;
-            crate::tls::save_files(&state.config.cert_dir, &p.id, &cert_pem, Some(&key_pem))
-                .map_err(|e| RpcError::new(-32603, format!("could not write cert files: {e}")))?;
+            // Single mutable lookup — no second find / `expect`. The cert borrow
+            // is held across generate/save (neither touches the store).
             let c = store
                 .certs
                 .iter_mut()
                 .find(|c| c.id == p.id)
-                .expect("checked above");
+                .ok_or_else(|| RpcError::not_found(format!("certificate {}", p.id)))?;
+            let (cert_pem, key_pem, expires) = crate::tls::generate_self_signed(&c.domain, 90)
+                .map_err(|e| RpcError::new(-32603, format!("renewal failed: {e}")))?;
+            crate::tls::save_files(&state.config.cert_dir, &p.id, &cert_pem, Some(&key_pem))
+                .map_err(|e| RpcError::new(-32603, format!("could not write cert files: {e}")))?;
             c.expires_at = expires.to_rfc3339();
             c.issuer = "FluxGate self-signed (local)".into();
             c.status = crate::tls::status_for(&expires);

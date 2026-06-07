@@ -17,6 +17,7 @@
 //! Enforcement happens on the **data plane** (the reverse proxy); the admin
 //! console is never evaluated, so a `deny /` rule can't lock you out.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -297,7 +298,11 @@ impl WafEngine {
 /// to catch double-encoding) and fold `\` → `/`. This makes encoded payloads
 /// (`%2e%2e%2f`, `..%5c`, `%2553`) match the same rules as their decoded form —
 /// matching what the origin will actually interpret.
-fn normalize_path(raw: &str) -> String {
+fn normalize_path(raw: &str) -> Cow<'_, str> {
+    // Fast path: clean target (the overwhelming majority) — borrow, no allocation.
+    if !raw.contains('%') && !raw.contains('\\') {
+        return Cow::Borrowed(raw);
+    }
     let mut cur = raw.to_string();
     for _ in 0..2 {
         let decoded = percent_decode(&cur);
@@ -309,7 +314,7 @@ fn normalize_path(raw: &str) -> String {
     if cur.contains('\\') {
         cur = cur.replace('\\', "/");
     }
-    cur
+    Cow::Owned(cur)
 }
 
 fn percent_decode(s: &str) -> String {

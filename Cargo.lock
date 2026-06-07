@@ -406,6 +406,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo",
  "thiserror 1.0.69",
  "time",

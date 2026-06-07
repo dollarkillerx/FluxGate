@@ -11,9 +11,10 @@
 //!   * **WebSocket / HTTP Upgrade** — the handshake is forwarded and the two
 //!     connections are bridged with bidirectional copy.
 //!
-//! WAF runs in **enforcement mode** here (`deny` → 403, `challenge` → 429),
-//! evaluated on the request line + headers (including the WS handshake). The
-//! admin plane stays detection-only so console rules can't lock you out.
+//! WAF runs in **enforcement mode** here: `deny` → 403, and `challenge` → a
+//! managed JS proof-of-work interstitial (see `challenge.rs`) that real browsers
+//! pass automatically while no-JS bots stay blocked. Evaluated on the request
+//! line + headers (including the WS handshake).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -135,7 +136,7 @@ async fn proxy_handler(
         .unwrap_or_else(|| peer.ip().to_string());
 
     // --- Routing + load balancing (single store lock, also decides redirect) -
-    let (upstream_name, address, waf_enabled) =
+    let (upstream_name, address, waf_enabled, default_waf) =
         match pick_target(&state, &host, &path, &client_ip, secure) {
             // Plaintext request for a TLS-enabled site with redirect on → 308 to https.
             RouteOutcome::Redirect => {
@@ -162,7 +163,8 @@ async fn proxy_handler(
                 upstream,
                 address,
                 waf_enabled,
-            } => (upstream, address, waf_enabled),
+                default_waf,
+            } => (upstream, address, waf_enabled, default_waf),
             RouteOutcome::NoRoute => {
                 log_request(
                     &state,
@@ -203,9 +205,9 @@ async fn proxy_handler(
                     .map(|s| (k.as_str().to_lowercase(), s.to_string()))
             })
             .collect();
-        // Only the default action needs the Store (brief lock); rule evaluation
-        // runs against the WAF engine's own lock-free compiled snapshot.
-        let default = state.store.lock().settings.default_waf_action;
+        // Default action came from pick_target's lock; rule evaluation runs
+        // against the WAF engine's own lock-free compiled snapshot — no re-lock.
+        let default = default_waf;
         let now_sec = Utc::now().timestamp().max(0) as u64;
         let ctx = WafContext {
             client_ip: &client_ip,
@@ -215,24 +217,48 @@ async fn proxy_handler(
             headers: &lc_headers,
         };
         let decision = state.waf.evaluate(default, &ctx, now_sec);
-        if decision.action != WafAction::Allow {
-            let (status, msg) = match decision.action {
-                WafAction::Deny => (StatusCode::FORBIDDEN, "Forbidden by WAF"),
-                _ => (StatusCode::TOO_MANY_REQUESTS, "Challenge required"),
-            };
-            record_event(&state, &client_ip, &path, &decision, decision.action);
-            log_request(
-                &state,
-                &client_ip,
-                &method,
-                &host,
-                &path,
-                status.as_u16(),
-                started,
-                "-",
-                decision.action,
-            );
-            return (status, msg).into_response();
+        match decision.action {
+            WafAction::Allow => {}
+            WafAction::Deny => {
+                record_event(&state, &client_ip, &path, &decision, decision.action);
+                log_request(
+                    &state,
+                    &client_ip,
+                    &method,
+                    &host,
+                    &path,
+                    403,
+                    started,
+                    "-",
+                    decision.action,
+                );
+                return (StatusCode::FORBIDDEN, "Forbidden by WAF").into_response();
+            }
+            WafAction::Challenge => {
+                // A real managed challenge: clients that already solved the
+                // proof-of-work carry a valid clearance cookie and pass; others
+                // get the interstitial page (and no-JS bots stay blocked).
+                let now_ts = Utc::now().timestamp();
+                let cookie = headers.get("cookie").and_then(|v| v.to_str().ok());
+                if !crate::challenge::has_clearance(cookie, &state.config.admin_token, now_ts) {
+                    record_event(&state, &client_ip, &path, &decision, decision.action);
+                    log_request(
+                        &state,
+                        &client_ip,
+                        &method,
+                        &host,
+                        &path,
+                        503,
+                        started,
+                        "-",
+                        decision.action,
+                    );
+                    let html = crate::challenge::page(&state.config.admin_token, now_ts);
+                    return (StatusCode::SERVICE_UNAVAILABLE, axum::response::Html(html))
+                        .into_response();
+                }
+                // Cleared — fall through and proxy the request.
+            }
         }
     }
 
@@ -394,6 +420,9 @@ enum RouteOutcome {
         upstream: String,
         address: String,
         waf_enabled: bool,
+        /// Default WAF action, read under the same lock so the hot path doesn't
+        /// re-lock the store just to fetch it.
+        default_waf: WafAction,
     },
     NoRoute,
     NoHealthyUpstream,
@@ -429,12 +458,14 @@ fn pick_target(
         return RouteOutcome::NoRoute;
     };
     let waf_enabled = route.waf_enabled;
+    let default_waf = store.settings.default_waf_action;
     let mut cursor = state.lb_cursor.lock();
     match select_node(upstream, client_ip, &mut cursor) {
         Some(address) => RouteOutcome::Found {
             upstream: upstream.name.clone(),
             address,
             waf_enabled,
+            default_waf,
         },
         None => RouteOutcome::NoHealthyUpstream,
     }

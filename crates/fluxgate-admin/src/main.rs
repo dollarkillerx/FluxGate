@@ -24,6 +24,7 @@
 
 mod assets;
 mod auth;
+mod challenge;
 mod collector;
 mod persist;
 mod proxy;
@@ -169,11 +170,14 @@ fn spawn_background_tasks(state: AppState) {
             ticker.tick().await;
             // Blocking connects run on a dedicated thread to avoid stalling the runtime.
             let store = store.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = tokio::task::spawn_blocking(move || {
                 let mut s = store.lock();
                 collector::probe_upstreams(&mut s);
             })
-            .await;
+            .await
+            {
+                tracing::warn!("upstream health probe task failed: {e}");
+            }
         }
     });
 
@@ -188,7 +192,7 @@ fn spawn_background_tasks(state: AppState) {
             ticker.tick().await;
             let (logs, events) = (logs.clone(), events.clone());
             // File rewrite is blocking IO — keep it off the async runtime.
-            let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = tokio::task::spawn_blocking(move || {
                 let cutoff = Utc::now() - chrono::Duration::days(retention_days);
                 let removed_logs = logs.lock().prune_older_than(cutoff);
                 let removed_events = events.lock().prune_older_than(cutoff);
@@ -198,7 +202,10 @@ fn spawn_background_tasks(state: AppState) {
                     );
                 }
             })
-            .await;
+            .await
+            {
+                tracing::warn!("log retention task failed: {e}");
+            }
         }
     });
 }

@@ -74,11 +74,13 @@ flows into the same dashboards / logs / metrics. It:
   **both** a `tls_enabled` site **and** a matching certificate; the site's chosen
   cert wins, else a domain match;
 - **redirects HTTP→HTTPS** (308) for TLS-enabled sites with redirect on;
-- runs the **WAF in enforcement mode** (`deny` → 403, `challenge` → 429),
-  counting hits (engine-side) and recording security events;
+- runs the **WAF in enforcement mode**: `deny` → 403, and `challenge` → a
+  **managed JS proof-of-work interstitial** that real browsers pass automatically
+  (signed clearance cookie) while no-JS bots/scanners stay blocked;
 - **streams** request/response bodies (SSE, large up/downloads — not buffered);
 - proxies **WebSocket / HTTP Upgrade** (handshake forwarded, connections bridged);
-- records a real access-log entry.
+- stamps a `Server: FluxGate/1.0` header (replacing the backend's) and records a
+  real access-log entry.
 
 ```bash
 # Create a site (host app.example.com) + a route (path / → upstream "web"), then:
@@ -105,10 +107,21 @@ curl -H 'Host: app.example.com' http://127.0.0.1:8088/etc/passwd   # → 403
 
 The **WAF engine** (`crates/fluxgate-admin/src/waf.rs`) supports `ip` (exact +
 IPv4 CIDR), `path` / `method` / `header` (regex), and `rate_limit`
-(`prefix@Nr/s`, real per-client fixed window). `geo` needs a GeoIP database and
-never matches. Rules are evaluated by ascending priority, first match wins,
-falling back to the default action. The data plane **enforces**; the admin
-console is never evaluated (so you can't lock yourself out).
+(`prefix@Nr/s`, real per-client fixed window, bounded memory). `geo` needs a
+GeoIP database and never matches. Rules are **compiled once** (regexes/CIDRs
+pre-built, priority-sorted) into a lock-free snapshot; path rules match the
+**path *and* query**, percent-decoded (so `%2e%2e` encoded traversal can't slip
+past). Rust's `regex` is linear-time, so attacker-supplied patterns can't ReDoS.
+First match wins, falling back to the default action. The data plane
+**enforces**; the admin console is never evaluated (so you can't lock yourself
+out).
+
+The **built-in baseline ruleset** covers dangerous methods, SQLi, NoSQLi, XSS,
+path traversal/LFI, RCE, Log4Shell (`${jndi:…}`), CRLF, web shells, secret files,
+scanner User-Agents, and rate limits. An **OWASP CRS pack** (a curated subset of
+the OWASP Core Rule Set, Apache-2.0) can be imported on demand from the WAF page
+(or via `waf.rule.import`) for SQLi/XSS/RCE/LFI/RFI/PHP/Java/SSRF/scanner
+coverage — no new dependency, since it's reimplemented as regex rules.
 
 **Log retention:** access logs and WAF events older than
 `FLUXGATE_LOG_RETENTION_DAYS` (default **6**) are pruned from memory and disk on
@@ -246,7 +259,7 @@ curl -sk -X POST https://127.0.0.1:8080/rpc -H "Authorization: Bearer $TOKEN" \
 | Sites | `site.list`, `site.get`, `site.create`, `site.update`, `site.delete` |
 | Routes | `route.list`, `route.get`, `route.create`, `route.update`, `route.delete`, `route.enable`, `route.disable` |
 | Upstreams | `upstream.list`, `upstream.get`, `upstream.create`, `upstream.update`, `upstream.delete`, `upstream.health` |
-| WAF | `waf.rule.list`, `waf.rule.get`, `waf.rule.create`, `waf.rule.update`, `waf.rule.delete`, `waf.rule.enable`, `waf.rule.disable`, `waf.event.list` |
+| WAF | `waf.rule.list`, `waf.rule.get`, `waf.rule.create`, `waf.rule.update`, `waf.rule.delete`, `waf.rule.enable`, `waf.rule.disable`, `waf.event.list`, `waf.pack.list`, `waf.rule.import` |
 | TLS | `tls.cert.list`, `tls.cert.get`, `tls.cert.request`, `tls.cert.renew`, `tls.cert.upload`, `tls.cert.delete` |
 | Logs | `access_log.list`, `access_log.search` |
 | Metrics | `metrics.system`, `metrics.traffic`, `metrics.route`, `metrics.upstream`, `metrics.waf` |
@@ -307,8 +320,8 @@ Microbenchmark over the **full baseline + OWASP CRS pack (32 regex/IP rules)**
 
 | Case | Cost | Throughput / core |
 | ---- | ---- | ----------------- |
-| Benign (every rule evaluated) | ~440 ns/req | ~2.3M req/s |
-| Attack (early match) | ~210 ns/req | ~4.7M req/s |
+| Benign (every rule evaluated) | ~350 ns/req | ~2.8M req/s |
+| Attack (early match) | ~190 ns/req | ~5.2M req/s |
 
 End-to-end (`ab -k -c50`, same backend), WAF **off vs on** was within noise
 (~25k req/s both, 0 failures) — the sub-microsecond WAF cost is dwarfed by
