@@ -1,0 +1,12 @@
+[package]
+name = "fluxgate-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FluxGate core domain models shared across the proxy runtime and admin API."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

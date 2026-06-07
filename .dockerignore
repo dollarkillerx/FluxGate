@@ -1,0 +1,11 @@
+target
+**/target
+web/node_modules
+web/dist
+fluxgate-data.json
+fluxgate-data.json.tmp
+fluxgate-certs
+*.log
+.git
+.github
+*.md

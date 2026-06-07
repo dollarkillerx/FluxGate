@@ -1,0 +1,1003 @@
+//! JSON-RPC 2.0 endpoint and method registry.
+//!
+//! A single `POST /rpc` entrypoint parses the envelope, dispatches on `method`,
+//! and wraps the result (or error) back into a spec-compliant response. The
+//! `dispatch` match IS the registry — every supported method appears there.
+//!
+//! Standard error codes used:
+//!   -32700 parse error · -32600 invalid request · -32601 method not found
+//!   -32602 invalid params · -32603 internal error · -32004 not found (custom)
+
+use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json};
+use chrono::Utc;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use std::sync::atomic::Ordering;
+
+use fluxgate_core::*;
+
+use crate::{collector, state::AppState};
+
+// ---------------------------------------------------------------------------
+// Envelope types
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RpcRequest {
+    #[serde(default)]
+    jsonrpc: String,
+    #[serde(default)]
+    id: Value,
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Serialize)]
+pub struct RpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+impl RpcError {
+    fn new(code: i64, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+    fn invalid_params(msg: impl Into<String>) -> Self {
+        Self::new(-32602, format!("Invalid params: {}", msg.into()))
+    }
+    fn not_found(what: impl Into<String>) -> Self {
+        Self::new(-32004, format!("Not found: {}", what.into()))
+    }
+}
+
+type RpcResult = Result<Value, RpcError>;
+
+// ---------------------------------------------------------------------------
+// HTTP handler
+// ---------------------------------------------------------------------------
+
+pub async fn handle_rpc(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    let req: RpcRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Json(error_response(
+                Value::Null,
+                RpcError::new(-32700, format!("Parse error: {e}")),
+            ));
+        }
+    };
+
+    let id = req.id.clone();
+
+    if req.jsonrpc != "2.0" {
+        return Json(error_response(
+            id,
+            RpcError::new(-32600, "Invalid request: jsonrpc must be \"2.0\""),
+        ));
+    }
+
+    // Bearer-token gate. Everything goes through /rpc, so auth is enforced here
+    // per-method: only PUBLIC methods (login) are reachable without a valid JWT.
+    if !is_public(&req.method) {
+        let valid = bearer_token(&headers)
+            .and_then(|t| crate::auth::verify_jwt(&t, state.admin_token()))
+            .is_some();
+        if !valid {
+            return Json(error_response(
+                id,
+                RpcError::new(-32001, "Unauthorized: missing or invalid session token"),
+            ));
+        }
+    }
+
+    tracing::debug!(method = %req.method, "rpc call");
+
+    let method = req.method.clone();
+    match dispatch(&state, &method, req.params) {
+        Ok(result) => {
+            // Snapshot to disk after any state-changing call succeeds.
+            if is_mutation(&method) {
+                let store = state.store.lock();
+                crate::persist::save(&state.config.data_path, &store);
+            }
+            Json(success_response(id, result))
+        }
+        Err(err) => {
+            tracing::warn!(method = %method, code = err.code, msg = %err.message, "rpc error");
+            Json(error_response(id, err))
+        }
+    }
+}
+
+/// Methods callable without authentication.
+fn is_public(method: &str) -> bool {
+    method == "auth.login"
+}
+
+/// Extract a `Bearer <token>` value from the Authorization header.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+}
+
+/// Whether a method mutates the store (and therefore should be persisted).
+fn is_mutation(method: &str) -> bool {
+    matches!(
+        method.rsplit('.').next(),
+        Some(
+            "create" | "update" | "delete" | "enable" | "disable" | "request" | "renew" | "upload"
+        )
+    ) || method == "settings.update"
+        || method == "auth.change_password"
+}
+
+fn success_response(id: Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+fn error_response(id: Value, err: RpcError) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": err.code, "message": err.message } })
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch / method registry
+// ---------------------------------------------------------------------------
+
+fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
+    let mut store = state.store.lock();
+
+    match method {
+        // ---- Auth ----
+        "auth.login" => {
+            // Public. Verifies the Argon2 hash and issues a signed, expiring JWT.
+            let p: LoginParams = parse(params)?;
+            let ok_creds = p.username == store.auth.username
+                && crate::auth::verify_password(&p.password, &store.auth.password_hash);
+            if ok_creds {
+                let token = crate::auth::issue_jwt(
+                    &store.auth.username,
+                    &state.config.admin_token,
+                    Utc::now().timestamp(),
+                )
+                .map_err(|e| RpcError::new(-32603, e))?;
+                tracing::info!(target: "fluxgate::audit", user = %p.username, "login succeeded");
+                ok(json!({ "token": token, "username": store.auth.username }))
+            } else {
+                tracing::warn!(target: "fluxgate::audit", user = %p.username, "login failed");
+                Err(RpcError::new(-32001, "Invalid username or password"))
+            }
+        }
+        "auth.change_password" => {
+            let p: ChangePasswordParams = parse(params)?;
+            if !crate::auth::verify_password(&p.current_password, &store.auth.password_hash) {
+                return Err(RpcError::new(-32001, "Current password is incorrect"));
+            }
+            if p.new_password.len() < 6 {
+                return Err(RpcError::invalid_params(
+                    "new password must be at least 6 characters",
+                ));
+            }
+            store.auth.password_hash = crate::auth::hash_password(&p.new_password)
+                .map_err(|e| RpcError::new(-32603, e))?;
+            if let Some(u) = p.username.filter(|u| !u.trim().is_empty()) {
+                store.auth.username = u.clone();
+                store.settings.admin_username = u;
+            }
+            audit("auth.change_password", &store.auth.username);
+            ok(json!({ "success": true, "username": store.auth.username }))
+        }
+
+        // ---- Dashboard (derived from real request logs + config) ----
+        "dashboard.summary" => {
+            let logs = state.logs.lock();
+            let events = state.waf_events.lock();
+            let inflight = state.inflight.load(Ordering::SeqCst);
+            ok(collector::dashboard_summary(
+                &store, &logs, &events, inflight,
+            ))
+        }
+        "dashboard.traffic" => {
+            let logs = state.logs.lock();
+            ok(json!({
+                "points": collector::traffic_points(&logs),
+                "top_routes": collector::top_routes(&logs),
+            }))
+        }
+        "dashboard.security_events" => {
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+            let mut events = state.waf_events.lock().snapshot();
+            events.truncate(limit);
+            ok(events)
+        }
+
+        // ---- Sites (hosts) ----
+        "site.list" => ok(&store.sites),
+        "site.get" => {
+            let p: IdParam = parse(params)?;
+            store
+                .sites
+                .iter()
+                .find(|s| s.id == p.id)
+                .map(ok_ref)
+                .unwrap_or_else(|| Err(RpcError::not_found(format!("site {}", p.id))))
+        }
+        "site.create" => {
+            let input: SiteInput = parse(params)?;
+            let host = input.host.unwrap_or_default();
+            if host.trim().is_empty() {
+                return Err(RpcError::invalid_params("`host` is required"));
+            }
+            let now = Utc::now().to_rfc3339();
+            let site = Site {
+                id: short_id("st"),
+                name: input
+                    .name
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| host.clone()),
+                host,
+                tls_enabled: input.tls_enabled.unwrap_or(true),
+                cert_id: input.cert_id.filter(|s| !s.is_empty()),
+                https_redirect: input.https_redirect.unwrap_or(true),
+                waf_enabled: input.waf_enabled.unwrap_or(true),
+                enabled: input.enabled.unwrap_or(true),
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            store.sites.insert(0, site.clone());
+            audit("site.create", &site.id);
+            ok(site)
+        }
+        "site.update" => {
+            let input: SiteInput = parse(params)?;
+            let id = require_id(&input.id)?;
+            let s = store
+                .sites
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or_else(|| RpcError::not_found(format!("site {id}")))?;
+            if let Some(v) = input.name {
+                s.name = v;
+            }
+            if let Some(v) = input.host {
+                s.host = v;
+            }
+            if let Some(v) = input.tls_enabled {
+                s.tls_enabled = v;
+            }
+            if let Some(v) = input.cert_id {
+                s.cert_id = if v.is_empty() { None } else { Some(v) };
+            }
+            if let Some(v) = input.https_redirect {
+                s.https_redirect = v;
+            }
+            if let Some(v) = input.waf_enabled {
+                s.waf_enabled = v;
+            }
+            if let Some(v) = input.enabled {
+                s.enabled = v;
+            }
+            s.updated_at = Utc::now().to_rfc3339();
+            let out = s.clone();
+            audit("site.update", &id);
+            ok(out)
+        }
+        "site.delete" => {
+            let p: IdParam = parse(params)?;
+            let before = store.sites.len();
+            store.sites.retain(|s| s.id != p.id);
+            if store.sites.len() == before {
+                return Err(RpcError::not_found(format!("site {}", p.id)));
+            }
+            // Cascade: remove the site's path routes too.
+            store.routes.retain(|r| r.site_id != p.id);
+            audit("site.delete", &p.id);
+            ok(json!({ "success": true, "id": p.id }))
+        }
+
+        // ---- Routes (paths under a site) ----
+        "route.list" => ok(&store.routes),
+        "route.get" => {
+            let p: IdParam = parse(params)?;
+            store
+                .routes
+                .iter()
+                .find(|r| r.id == p.id)
+                .map(ok_ref)
+                .unwrap_or_else(|| Err(RpcError::not_found(format!("route {}", p.id))))
+        }
+        "route.create" => {
+            let input: RouteInput = parse(params)?;
+            let site_id = input.site_id.filter(|s| !s.is_empty());
+            let Some(site_id) = site_id else {
+                return Err(RpcError::invalid_params("`site_id` is required"));
+            };
+            let site = store
+                .sites
+                .iter()
+                .find(|s| s.id == site_id)
+                .ok_or_else(|| RpcError::not_found(format!("site {site_id}")))?;
+            // New paths inherit the site's default WAF setting unless specified.
+            let waf_default = site.waf_enabled;
+            let now = Utc::now().to_rfc3339();
+            let route = Route {
+                id: short_id("rt"),
+                site_id,
+                name: input.name.unwrap_or_default(),
+                path: input.path.unwrap_or_else(|| "/".into()),
+                upstream: input.upstream.unwrap_or_default(),
+                waf_enabled: input.waf_enabled.unwrap_or(waf_default),
+                enabled: input.enabled.unwrap_or(true),
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            store.routes.insert(0, route.clone());
+            audit("route.create", &route.id);
+            ok(route)
+        }
+        "route.update" => {
+            let input: RouteInput = parse(params)?;
+            let id = require_id(&input.id)?;
+            let r = store
+                .routes
+                .iter_mut()
+                .find(|r| r.id == id)
+                .ok_or_else(|| RpcError::not_found(format!("route {id}")))?;
+            if let Some(v) = input.site_id.filter(|s| !s.is_empty()) {
+                r.site_id = v;
+            }
+            if let Some(v) = input.name {
+                r.name = v;
+            }
+            if let Some(v) = input.path {
+                r.path = v;
+            }
+            if let Some(v) = input.upstream {
+                r.upstream = v;
+            }
+            if let Some(v) = input.waf_enabled {
+                r.waf_enabled = v;
+            }
+            if let Some(v) = input.enabled {
+                r.enabled = v;
+            }
+            r.updated_at = Utc::now().to_rfc3339();
+            let out = r.clone();
+            audit("route.update", &id);
+            ok(out)
+        }
+        "route.delete" => {
+            let p: IdParam = parse(params)?;
+            let before = store.routes.len();
+            store.routes.retain(|r| r.id != p.id);
+            if store.routes.len() == before {
+                return Err(RpcError::not_found(format!("route {}", p.id)));
+            }
+            audit("route.delete", &p.id);
+            ok(json!({ "success": true, "id": p.id }))
+        }
+        "route.enable" => set_route_enabled(&mut store, params, true),
+        "route.disable" => set_route_enabled(&mut store, params, false),
+
+        // ---- Upstreams ----
+        "upstream.list" => ok(&store.upstreams),
+        "upstream.get" => {
+            let p: IdParam = parse(params)?;
+            store
+                .upstreams
+                .iter()
+                .find(|u| u.id == p.id)
+                .map(ok_ref)
+                .unwrap_or_else(|| Err(RpcError::not_found(format!("upstream {}", p.id))))
+        }
+        "upstream.create" => {
+            let input: UpstreamInput = parse(params)?;
+            let mut up = Upstream {
+                id: short_id("up"),
+                name: input.name.unwrap_or_else(|| "new-upstream".into()),
+                strategy: input.strategy.unwrap_or(LbStrategy::RoundRobin),
+                servers: input.servers.unwrap_or_default(),
+                healthy_servers: 0,
+                status: UpstreamStatus::Down,
+            };
+            // Probe immediately so the returned/persisted status reflects reality
+            // right away instead of trusting the client-supplied `healthy` flag
+            // (which would otherwise show green until the next background sweep).
+            collector::probe_one_upstream(&mut up);
+            store.upstreams.insert(0, up.clone());
+            audit("upstream.create", &up.id);
+            ok(up)
+        }
+        "upstream.update" => {
+            let input: UpstreamInput = parse(params)?;
+            let id = require_id(&input.id)?;
+            let u = store
+                .upstreams
+                .iter_mut()
+                .find(|u| u.id == id)
+                .ok_or_else(|| RpcError::not_found(format!("upstream {id}")))?;
+            if let Some(v) = input.name {
+                u.name = v;
+            }
+            if let Some(v) = input.strategy {
+                u.strategy = v;
+            }
+            if let Some(v) = input.servers {
+                u.servers = v;
+            }
+            // Re-probe on every edit so an added/changed node's health is accurate
+            // immediately rather than after the next background sweep.
+            collector::probe_one_upstream(u);
+            let out = u.clone();
+            audit("upstream.update", &id);
+            ok(out)
+        }
+        "upstream.delete" => {
+            let p: IdParam = parse(params)?;
+            let before = store.upstreams.len();
+            store.upstreams.retain(|u| u.id != p.id);
+            if store.upstreams.len() == before {
+                return Err(RpcError::not_found(format!("upstream {}", p.id)));
+            }
+            audit("upstream.delete", &p.id);
+            ok(json!({ "success": true, "id": p.id }))
+        }
+        "upstream.health" => {
+            // Real TCP probe of every node in this upstream, right now.
+            let p: IdParam = parse(params)?;
+            let u = store
+                .upstreams
+                .iter_mut()
+                .find(|u| u.id == p.id)
+                .ok_or_else(|| RpcError::not_found(format!("upstream {}", p.id)))?;
+            collector::probe_one_upstream(u);
+            ok(u.clone())
+        }
+
+        // ---- WAF rules ----
+        "waf.rule.list" => {
+            // Overlay the engine's live hit counters (kept off the hot path).
+            let hits = state.waf.hits();
+            let rules: Vec<WafRule> = store
+                .waf_rules
+                .iter()
+                .map(|r| {
+                    let mut r = r.clone();
+                    r.hit_count = hits.get(&r.id).copied().unwrap_or(0);
+                    r
+                })
+                .collect();
+            ok(rules)
+        }
+        "waf.rule.get" => {
+            let p: IdParam = parse(params)?;
+            store
+                .waf_rules
+                .iter()
+                .find(|r| r.id == p.id)
+                .map(ok_ref)
+                .unwrap_or_else(|| Err(RpcError::not_found(format!("waf rule {}", p.id))))
+        }
+        "waf.rule.create" => {
+            let input: WafRuleInput = parse(params)?;
+            let rule = WafRule {
+                id: short_id("wr"),
+                name: input.name.unwrap_or_else(|| "New Rule".into()),
+                description: input.description.unwrap_or_default(),
+                match_type: input.match_type.unwrap_or(WafMatchType::Path),
+                pattern: input.pattern.unwrap_or_default(),
+                action: input.action.unwrap_or(WafAction::Deny),
+                priority: input.priority.unwrap_or(50),
+                enabled: input.enabled.unwrap_or(true),
+                hit_count: 0,
+            };
+            store.waf_rules.insert(0, rule.clone());
+            audit("waf.rule.create", &rule.id);
+            ok(rule)
+        }
+        "waf.rule.update" => {
+            let input: WafRuleInput = parse(params)?;
+            let id = require_id(&input.id)?;
+            let r = store
+                .waf_rules
+                .iter_mut()
+                .find(|r| r.id == id)
+                .ok_or_else(|| RpcError::not_found(format!("waf rule {id}")))?;
+            if let Some(v) = input.name {
+                r.name = v;
+            }
+            if let Some(v) = input.description {
+                r.description = v;
+            }
+            if let Some(v) = input.match_type {
+                r.match_type = v;
+            }
+            if let Some(v) = input.pattern {
+                r.pattern = v;
+            }
+            if let Some(v) = input.action {
+                r.action = v;
+            }
+            if let Some(v) = input.priority {
+                r.priority = v;
+            }
+            if let Some(v) = input.enabled {
+                r.enabled = v;
+            }
+            let out = r.clone();
+            audit("waf.rule.update", &id);
+            ok(out)
+        }
+        "waf.rule.delete" => {
+            let p: IdParam = parse(params)?;
+            let before = store.waf_rules.len();
+            store.waf_rules.retain(|r| r.id != p.id);
+            if store.waf_rules.len() == before {
+                return Err(RpcError::not_found(format!("waf rule {}", p.id)));
+            }
+            audit("waf.rule.delete", &p.id);
+            ok(json!({ "success": true, "id": p.id }))
+        }
+        "waf.rule.enable" => set_rule_enabled(&mut store, params, true),
+        "waf.rule.disable" => set_rule_enabled(&mut store, params, false),
+        "waf.event.list" => {
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
+            let mut events = state.waf_events.lock().snapshot();
+            events.truncate(limit);
+            ok(events)
+        }
+
+        // ---- TLS (real keypair generation + PEM parsing) ----
+        "tls.cert.list" => {
+            // Recompute status from the real expiry on every read.
+            let mut list = store.certs.clone();
+            for c in &mut list {
+                if let Some(dt) = crate::tls::parse_dt(&c.expires_at) {
+                    c.status = crate::tls::status_for(&dt);
+                }
+            }
+            ok(list)
+        }
+        "tls.cert.get" => {
+            let p: IdParam = parse(params)?;
+            store
+                .certs
+                .iter()
+                .find(|c| c.id == p.id)
+                .map(ok_ref)
+                .unwrap_or_else(|| Err(RpcError::not_found(format!("certificate {}", p.id))))
+        }
+        "tls.cert.request" => {
+            // Generates a REAL self-signed keypair + X.509 cert (local issuer).
+            // A real ACME client would replace this call's body; the rest of the
+            // pipeline (storage, status, renewal) stays identical.
+            let p: DomainParam = parse(params)?;
+            let id = short_id("ct");
+            let (cert_pem, key_pem, expires) = crate::tls::generate_self_signed(&p.domain, 90)
+                .map_err(|e| {
+                    RpcError::new(-32603, format!("certificate generation failed: {e}"))
+                })?;
+            crate::tls::save_files(&state.config.cert_dir, &id, &cert_pem, Some(&key_pem))
+                .map_err(|e| RpcError::new(-32603, format!("could not write cert files: {e}")))?;
+            let cert = TlsCertificate {
+                id: id.clone(),
+                domain: p.domain,
+                issuer: "FluxGate self-signed (local)".into(),
+                expires_at: expires.to_rfc3339(),
+                auto_renew: true,
+                status: crate::tls::status_for(&expires),
+            };
+            store.certs.insert(0, cert.clone());
+            audit("tls.cert.request", &id);
+            ok(cert)
+        }
+        "tls.cert.renew" => {
+            // Re-issue a fresh real keypair/cert for the same domain.
+            let p: IdParam = parse(params)?;
+            let domain = store
+                .certs
+                .iter()
+                .find(|c| c.id == p.id)
+                .map(|c| c.domain.clone())
+                .ok_or_else(|| RpcError::not_found(format!("certificate {}", p.id)))?;
+            let (cert_pem, key_pem, expires) = crate::tls::generate_self_signed(&domain, 90)
+                .map_err(|e| RpcError::new(-32603, format!("renewal failed: {e}")))?;
+            crate::tls::save_files(&state.config.cert_dir, &p.id, &cert_pem, Some(&key_pem))
+                .map_err(|e| RpcError::new(-32603, format!("could not write cert files: {e}")))?;
+            let c = store
+                .certs
+                .iter_mut()
+                .find(|c| c.id == p.id)
+                .expect("checked above");
+            c.expires_at = expires.to_rfc3339();
+            c.issuer = "FluxGate self-signed (local)".into();
+            c.status = crate::tls::status_for(&expires);
+            let out = c.clone();
+            audit("tls.cert.renew", &p.id);
+            ok(out)
+        }
+        "tls.cert.upload" => {
+            // Parse the REAL uploaded PEM: subject/issuer/expiry come from the cert.
+            let p: CertUploadParam = parse(params)?;
+            let cert_pem = p
+                .cert_pem
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| RpcError::invalid_params("missing `cert_pem`"))?;
+            let parsed = crate::tls::parse_pem(&cert_pem)
+                .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+            let id = short_id("ct");
+            crate::tls::save_files(&state.config.cert_dir, &id, &cert_pem, p.key_pem.as_deref())
+                .map_err(|e| RpcError::new(-32603, format!("could not write cert files: {e}")))?;
+            let cert = TlsCertificate {
+                id: id.clone(),
+                domain: p.domain.filter(|d| !d.is_empty()).unwrap_or(parsed.domain),
+                issuer: parsed.issuer,
+                expires_at: parsed.not_after.to_rfc3339(),
+                auto_renew: p.auto_renew.unwrap_or(false),
+                status: crate::tls::status_for(&parsed.not_after),
+            };
+            store.certs.insert(0, cert.clone());
+            audit("tls.cert.upload", &id);
+            ok(cert)
+        }
+        "tls.cert.delete" => {
+            let p: IdParam = parse(params)?;
+            let before = store.certs.len();
+            store.certs.retain(|c| c.id != p.id);
+            if store.certs.len() == before {
+                return Err(RpcError::not_found(format!("certificate {}", p.id)));
+            }
+            crate::tls::delete_files(&state.config.cert_dir, &p.id);
+            audit("tls.cert.delete", &p.id);
+            ok(json!({ "success": true, "id": p.id }))
+        }
+
+        // ---- Access logs (real requests served by this process) ----
+        "access_log.list" => {
+            let p: LogQuery = parse_or_default(params)?;
+            let logs = state.logs.lock().snapshot();
+            ok(paginate(&logs, p.offset, p.limit.unwrap_or(50)))
+        }
+        "access_log.search" => {
+            let p: LogQuery = parse_or_default(params)?;
+            let snap = state.logs.lock().snapshot();
+            let filtered: Vec<AccessLog> =
+                snap.into_iter().filter(|l| log_matches(l, &p)).collect();
+            let total = filtered.len();
+            let limit = p.limit.unwrap_or(50);
+            let items: Vec<AccessLog> = filtered.into_iter().skip(p.offset).take(limit).collect();
+            ok(json!({ "items": items, "total": total }))
+        }
+
+        // ---- Metrics (real host telemetry + derived request metrics) ----
+        "metrics.system" => ok(state.telemetry.lock().metrics_system()),
+        "metrics.traffic" => {
+            let logs = state.logs.lock();
+            ok(collector::metrics_traffic(&logs))
+        }
+        "metrics.route" => {
+            let p: RouteMetricsParam = parse(params)?;
+            let logs = state.logs.lock();
+            let path = p.path.unwrap_or_else(|| "/".into());
+            ok(collector::metrics_route(&logs, &p.host, &path))
+        }
+        "metrics.upstream" => ok(collector::metrics_upstream(&store)),
+        "metrics.waf" => {
+            let events = state.waf_events.lock();
+            ok(collector::metrics_waf(&events))
+        }
+
+        // ---- Settings / system ----
+        "settings.get" => ok(&store.settings),
+        "settings.update" => {
+            let input: SettingsInput = parse(params)?;
+            apply_settings(&mut store.settings, input);
+            // Keep the login username in sync with the displayed admin username.
+            store.auth.username = store.settings.admin_username.clone();
+            audit("settings.update", "settings");
+            ok(store.settings.clone())
+        }
+        "system.reload" => {
+            audit("system.reload", "config");
+            ok(json!({
+                "success": true,
+                "message": "Configuration reloaded",
+                "reloaded_at": Utc::now().to_rfc3339(),
+            }))
+        }
+        "system.info" => ok(state.telemetry.lock().system_info()),
+
+        _ => Err(RpcError::new(-32601, format!("Method not found: {method}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small per-method helpers
+// ---------------------------------------------------------------------------
+
+fn set_route_enabled(store: &mut crate::state::Store, params: Value, enabled: bool) -> RpcResult {
+    let p: IdParam = parse(params)?;
+    let r = store
+        .routes
+        .iter_mut()
+        .find(|r| r.id == p.id)
+        .ok_or_else(|| RpcError::not_found(format!("route {}", p.id)))?;
+    r.enabled = enabled;
+    r.updated_at = Utc::now().to_rfc3339();
+    let out = r.clone();
+    audit(
+        if enabled {
+            "route.enable"
+        } else {
+            "route.disable"
+        },
+        &p.id,
+    );
+    ok(out)
+}
+
+fn set_rule_enabled(store: &mut crate::state::Store, params: Value, enabled: bool) -> RpcResult {
+    let p: IdParam = parse(params)?;
+    let r = store
+        .waf_rules
+        .iter_mut()
+        .find(|r| r.id == p.id)
+        .ok_or_else(|| RpcError::not_found(format!("waf rule {}", p.id)))?;
+    r.enabled = enabled;
+    let out = r.clone();
+    audit(
+        if enabled {
+            "waf.rule.enable"
+        } else {
+            "waf.rule.disable"
+        },
+        &p.id,
+    );
+    ok(out)
+}
+
+fn apply_settings(s: &mut Settings, input: SettingsInput) {
+    if let Some(v) = input.admin_username {
+        s.admin_username = v;
+    }
+    if let Some(v) = input.admin_email {
+        s.admin_email = v;
+    }
+    if let Some(v) = input.log_level {
+        s.log_level = v;
+    }
+    if let Some(v) = input.hot_reload {
+        s.hot_reload = v;
+    }
+    if let Some(v) = input.default_waf_action {
+        s.default_waf_action = v;
+    }
+    if let Some(v) = input.worker_threads {
+        s.worker_threads = v;
+    }
+    if let Some(v) = input.max_connections {
+        s.max_connections = v;
+    }
+    if let Some(v) = input.request_timeout_secs {
+        s.request_timeout_secs = v;
+    }
+    if let Some(a) = input.acme {
+        if let Some(v) = a.enabled {
+            s.acme.enabled = v;
+        }
+        if let Some(v) = a.directory_url {
+            s.acme.directory_url = v;
+        }
+        if let Some(v) = a.email {
+            s.acme.email = v;
+        }
+        if let Some(v) = a.agree_tos {
+            s.acme.agree_tos = v;
+        }
+    }
+}
+
+fn log_matches(l: &AccessLog, q: &LogQuery) -> bool {
+    if let Some(host) = &q.host {
+        if !host.is_empty() && &l.host != host {
+            return false;
+        }
+    }
+    if let Some(status) = q.status {
+        if l.status != status {
+            return false;
+        }
+    }
+    if let Some(action) = q.waf_action {
+        if l.waf_action != action {
+            return false;
+        }
+    }
+    if let Some(query) = &q.query {
+        let needle = query.to_lowercase();
+        if !needle.is_empty() {
+            let hay = format!(
+                "{} {} {} {} {} {}",
+                l.client_ip, l.method, l.host, l.path, l.upstream, l.status
+            )
+            .to_lowercase();
+            if !hay.contains(&needle) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Generic helpers
+// ---------------------------------------------------------------------------
+
+/// Audit log for sensitive/state-changing operations.
+fn audit(action: &str, target: &str) {
+    tracing::info!(target: "fluxgate::audit", action, target, "admin action");
+}
+
+fn short_id(prefix: &str) -> String {
+    let u = uuid::Uuid::new_v4().simple().to_string();
+    format!("{prefix}-{}", &u[..8])
+}
+
+fn ok<T: Serialize>(value: T) -> RpcResult {
+    serde_json::to_value(value).map_err(|e| RpcError::new(-32603, format!("Serialize error: {e}")))
+}
+
+fn ok_ref<T: Serialize>(value: &T) -> RpcResult {
+    ok(value)
+}
+
+fn parse<T: DeserializeOwned>(params: Value) -> Result<T, RpcError> {
+    serde_json::from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))
+}
+
+/// Like `parse`, but a missing/`null` params object yields `T::default()`.
+fn parse_or_default<T: DeserializeOwned + Default>(params: Value) -> Result<T, RpcError> {
+    if params.is_null() {
+        return Ok(T::default());
+    }
+    parse(params)
+}
+
+fn require_id(id: &Option<String>) -> Result<String, RpcError> {
+    id.clone()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| RpcError::invalid_params("missing `id`"))
+}
+
+fn paginate<T: Clone + Serialize>(items: &[T], offset: usize, limit: usize) -> Value {
+    let total = items.len();
+    let page: Vec<T> = items.iter().skip(offset).take(limit).cloned().collect();
+    json!({ "items": page, "total": total })
+}
+
+// ---------------------------------------------------------------------------
+// Param structs
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct LoginParams {
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordParams {
+    current_password: String,
+    new_password: String,
+    username: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IdParam {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct RouteMetricsParam {
+    host: String,
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DomainParam {
+    domain: String,
+}
+
+#[derive(Deserialize)]
+struct SiteInput {
+    id: Option<String>,
+    name: Option<String>,
+    host: Option<String>,
+    tls_enabled: Option<bool>,
+    cert_id: Option<String>,
+    https_redirect: Option<bool>,
+    waf_enabled: Option<bool>,
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RouteInput {
+    id: Option<String>,
+    site_id: Option<String>,
+    name: Option<String>,
+    path: Option<String>,
+    upstream: Option<String>,
+    waf_enabled: Option<bool>,
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct UpstreamInput {
+    id: Option<String>,
+    name: Option<String>,
+    strategy: Option<LbStrategy>,
+    servers: Option<Vec<UpstreamServer>>,
+}
+
+#[derive(Deserialize)]
+struct WafRuleInput {
+    id: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    match_type: Option<WafMatchType>,
+    pattern: Option<String>,
+    action: Option<WafAction>,
+    priority: Option<u32>,
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CertUploadParam {
+    domain: Option<String>,
+    cert_pem: Option<String>,
+    key_pem: Option<String>,
+    auto_renew: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct LogQuery {
+    query: Option<String>,
+    host: Option<String>,
+    status: Option<u16>,
+    waf_action: Option<WafAction>,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SettingsInput {
+    admin_username: Option<String>,
+    admin_email: Option<String>,
+    log_level: Option<String>,
+    hot_reload: Option<bool>,
+    default_waf_action: Option<WafAction>,
+    worker_threads: Option<u32>,
+    max_connections: Option<u32>,
+    request_timeout_secs: Option<u32>,
+    acme: Option<AcmeInput>,
+}
+
+#[derive(Deserialize)]
+struct AcmeInput {
+    enabled: Option<bool>,
+    directory_url: Option<String>,
+    email: Option<String>,
+    agree_tos: Option<bool>,
+}

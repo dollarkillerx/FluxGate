@@ -1,0 +1,43 @@
+[package]
+name = "fluxgate-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FluxGate admin server: JSON-RPC 2.0 management API + embedded web console."
+
+[[bin]]
+name = "fluxgate-admin"
+path = "src/main.rs"
+
+[dependencies]
+fluxgate-core = { path = "../fluxgate-core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+sysinfo = { workspace = true }
+num_cpus = { workspace = true }
+regex = { workspace = true }
+rcgen = { workspace = true }
+x509-parser = { workspace = true }
+time = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+parking_lot = { workspace = true }
+argon2 = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand_core = { workspace = true }

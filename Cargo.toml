@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["crates/fluxgate-core", "crates/fluxgate-admin"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["FluxGate Authors"]
+repository = "https://github.com/fluxgate/fluxgate"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+thiserror = "1"
+rust-embed = { version = "8", features = ["debug-embed", "interpolate-folder-path"] }
+mime_guess = "2"
+sysinfo = "0.31"
+num_cpus = "1"
+regex = "1"
+rcgen = "0.13"
+x509-parser = "0.16"
+time = "0.3"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+parking_lot = "0.12"
+argon2 = "0.5"
+jsonwebtoken = "9"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

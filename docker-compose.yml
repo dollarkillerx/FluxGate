@@ -1,0 +1,19 @@
+services:
+  fluxgate:
+    build: .
+    image: fluxgate-admin:latest
+    ports:
+      - "8080:8080" # admin console + JSON-RPC (HTTPS, self-signed)
+      - "8081:8081" # reverse proxy data plane (HTTP)
+      - "8443:8443" # reverse proxy data plane (HTTPS, SNI)
+    environment:
+      # Change these before exposing the service.
+      FLUXGATE_ADMIN_USER: admin
+      FLUXGATE_ADMIN_PASSWORD: admin
+      FLUXGATE_ADMIN_TOKEN: change-me-jwt-signing-secret
+      RUST_LOG: info
+    volumes:
+      - fluxgate-data:/data
+
+volumes:
+  fluxgate-data:
