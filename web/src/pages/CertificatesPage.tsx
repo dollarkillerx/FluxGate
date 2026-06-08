@@ -1,11 +1,12 @@
 import { useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { createColumnHelper } from '@tanstack/react-table'
-import { Plus, Upload, RefreshCw, Trash2 } from 'lucide-react'
+import { Plus, Upload, RefreshCw, Trash2, ShieldCheck, Info } from 'lucide-react'
 import { useRpc } from '@/hooks/useRpc'
 import { rpc } from '@/api/rpc'
 import { useToast } from '@/context/ToastContext'
 import { useI18n } from '@/i18n/I18nContext'
-import type { TlsCertificate } from '@/types'
+import type { TlsCertificate, Settings } from '@/types'
 import type { Translate } from '@/i18n/I18nContext'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Card } from '@/components/ui/Card'
@@ -35,6 +36,9 @@ export function CertificatesPage() {
   // Poll so a Pending ACME cert flips to Valid automatically once the
   // background HTTP-01 order completes (issuance takes ~10-60s).
   const { data, loading, error, refetch } = useRpc<TlsCertificate[]>('tls.cert.list', {}, [], 5000)
+  // Drives the request dialog's hint: ACME on → Let's Encrypt; off → self-signed.
+  const { data: settings } = useRpc<Settings>('settings.get')
+  const acmeOn = !!(settings?.acme.enabled && settings?.acme.agree_tos)
 
   const [requestOpen, setRequestOpen] = useState(false)
   const [uploadOpen, setUploadOpen] = useState(false)
@@ -61,7 +65,10 @@ export function CertificatesPage() {
     setBusy(true)
     try {
       await rpc.call('tls.cert.request', { domain: reqDomain.trim() })
-      toast.success(t('certs.requested'), t('certs.requestedDesc', { domain: reqDomain }))
+      toast.success(
+        t('certs.requested'),
+        t(acmeOn ? 'certs.requestedAcme' : 'certs.requestedSelf', { domain: reqDomain }),
+      )
       setRequestOpen(false)
       setReqDomain('')
       refetch()
@@ -202,6 +209,22 @@ export function CertificatesPage() {
           </>
         }
       >
+        {acmeOn ? (
+          <div className="mb-4 flex items-start gap-2 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-300">
+            <ShieldCheck size={16} className="mt-0.5 shrink-0" />
+            <span>{t('certs.acmeOnHint')}</span>
+          </div>
+        ) : (
+          <div className="mb-4 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+            <Info size={16} className="mt-0.5 shrink-0" />
+            <span>
+              {t('certs.acmeOffHint')}{' '}
+              <Link to="/settings" className="font-medium underline underline-offset-2 hover:text-amber-900 dark:hover:text-amber-200">
+                {t('certs.acmeOffCta')}
+              </Link>
+            </span>
+          </div>
+        )}
         <Field label={t('certs.field.domain')} hint={t('certs.domainHint')}>
           <Input value={reqDomain} onChange={(e) => setReqDomain(e.target.value)} placeholder="app.example.com" />
         </Field>

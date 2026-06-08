@@ -647,11 +647,15 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
 
         // ---- TLS (real keypair generation + PEM parsing) ----
         "tls.cert.list" => {
-            // Recompute status from the real expiry on every read.
+            // Recompute status from the real expiry on every read — but keep a
+            // `Pending` cert (ACME issuance in flight) as Pending. Its placeholder
+            // expiry is "now", which would otherwise mis-render as "expiring".
             let mut list = store.certs.clone();
             for c in &mut list {
-                if let Some(dt) = crate::tls::parse_dt(&c.expires_at) {
-                    c.status = crate::tls::status_for(&dt);
+                if c.status != CertStatus::Pending {
+                    if let Some(dt) = crate::tls::parse_dt(&c.expires_at) {
+                        c.status = crate::tls::status_for(&dt);
+                    }
                 }
             }
             ok(list)

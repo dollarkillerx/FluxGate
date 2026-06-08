@@ -336,19 +336,24 @@ fn resolve_addr_env(var: &str, default: &str) -> Option<SocketAddr> {
 /// * unset → default `fluxgate-geoip/GeoLite2-Country.mmdb`; if missing, it's
 ///   **auto-downloaded** from the P3TERX/GeoLite.mmdb mirror (best effort).
 fn resolve_geoip_path() -> Option<PathBuf> {
-    match std::env::var("FLUXGATE_GEOIP_DB") {
+    // `FLUXGATE_GEOIP_DB` empty → explicitly disabled; set → use that path;
+    // unset → default location. In the latter two cases the DB is auto-downloaded
+    // when missing (so pointing the env var at a fresh path still self-heals
+    // instead of silently leaving country lookups unresolved).
+    let path = match std::env::var("FLUXGATE_GEOIP_DB") {
         Ok(v) if v.is_empty() => return None,
-        Ok(v) => return Some(PathBuf::from(v)),
-        Err(_) => {}
+        Ok(v) => PathBuf::from(v),
+        Err(_) => PathBuf::from("fluxgate-geoip/GeoLite2-Country.mmdb"),
+    };
+    if path.exists() {
+        return Some(path);
     }
-    let default = PathBuf::from("fluxgate-geoip/GeoLite2-Country.mmdb");
-    if default.exists() {
-        return Some(default);
-    }
-    match download_geoip(&default) {
-        Ok(()) => Some(default),
+    match download_geoip(&path) {
+        Ok(()) => Some(path),
         Err(e) => {
-            tracing::warn!("GeoIP auto-download failed: {e} — `geo` rules disabled");
+            tracing::warn!(
+                "GeoIP auto-download failed: {e} — country stats / `geo` rules disabled"
+            );
             None
         }
     }

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Plus, Pencil, Trash2, Activity, Globe, ShieldCheck, Lock, ChevronRight } from 'lucide-react'
 import { useRpc } from '@/hooks/useRpc'
@@ -31,6 +31,19 @@ interface SiteForm {
   enabled: boolean
 }
 const emptySite: SiteForm = { name: '', host: '', tls_enabled: true, cert_id: '', https_redirect: true, waf_enabled: true, enabled: true }
+
+/** A certificate covers `host` if its domain matches exactly (case-insensitive)
+ *  or via a single-label wildcard (`*.example.com` ⊇ `a.example.com`). */
+function certMatchesHost(certDomain: string, host: string): boolean {
+  if (!host) return false
+  const c = certDomain.toLowerCase()
+  const h = host.toLowerCase()
+  if (c === h) return true
+  if (c.startsWith('*.')) {
+    return h.endsWith(c.slice(1)) && h.split('.').length === c.split('.').length
+  }
+  return false
+}
 
 interface RouteForm {
   id?: string
@@ -65,6 +78,28 @@ export function RoutesPage() {
     for (const r of routes.data ?? []) (map[r.site_id] ??= []).push(r)
     return map
   }, [routes.data])
+
+  // Certificate options for the site form: if any cert matches the host, show
+  // only those (e.g. hide `localhost` when a cert for the real domain exists).
+  // The currently-selected cert is always kept so editing never loses it.
+  const host = siteForm?.host ?? ''
+  const certOptions = useMemo(() => {
+    const all = certs.data ?? []
+    const matching = all.filter((c) => certMatchesHost(c.domain, host))
+    let opts = matching.length > 0 ? matching : all
+    if (siteForm?.cert_id && !opts.some((c) => c.id === siteForm.cert_id)) {
+      const sel = all.find((c) => c.id === siteForm.cert_id)
+      if (sel) opts = [...opts, sel]
+    }
+    return opts
+  }, [certs.data, host, siteForm?.cert_id])
+
+  // Auto-select the matching cert when none is chosen yet (new-site flow).
+  useEffect(() => {
+    if (!siteForm || !siteForm.tls_enabled || siteForm.cert_id) return
+    const match = (certs.data ?? []).find((c) => certMatchesHost(c.domain, siteForm.host))
+    if (match) setSiteForm((f) => (f ? { ...f, cert_id: match.id } : f))
+  }, [siteForm, certs.data])
 
   const reload = () => {
     sites.refetch()
@@ -278,7 +313,7 @@ export function RoutesPage() {
                 <Field label={t('routes.field.cert')} hint={certs.data && certs.data.length === 0 ? t('routes.noCerts') : t('routes.certHint')}>
                   <Select value={siteForm.cert_id} onChange={(e) => setSiteForm({ ...siteForm, cert_id: e.target.value })}>
                     <option value="" disabled>{t('routes.selectCert')}</option>
-                    {certs.data?.map((c) => (
+                    {certOptions.map((c) => (
                       <option key={c.id} value={c.id}>{c.domain} · {t(`enum.certStatus.${c.status}`)}</option>
                     ))}
                   </Select>
