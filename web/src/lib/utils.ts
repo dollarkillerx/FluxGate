@@ -69,3 +69,19 @@ export function formatUptime(secs: number): string {
   const m = Math.floor((secs % 3600) / 60)
   return [d && `${d}d`, h && `${h}h`, `${m}m`].filter(Boolean).join(' ')
 }
+
+/** ISO alpha-2 country code → flag emoji (regional indicators); 🌐 for unknown. */
+export function flag(cc: string): string {
+  if (!/^[A-Za-z]{2}$/.test(cc)) return '🌐'
+  return String.fromCodePoint(...[...cc.toUpperCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65))
+}
+
+/** Country code → localized country name (via Intl), or `unknown` for "??". */
+export function countryLabel(cc: string, locale: string, unknown: string): string {
+  if (cc === '??' || !/^[A-Za-z]{2}$/.test(cc)) return unknown
+  try {
+    return new Intl.DisplayNames([locale], { type: 'region' }).of(cc.toUpperCase()) ?? cc
+  } catch {
+    return cc
+  }
+}

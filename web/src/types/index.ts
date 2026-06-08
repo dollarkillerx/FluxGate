@@ -85,6 +85,8 @@ export interface TlsCertificate {
   expires_at: string
   auto_renew: boolean
   status: CertStatus
+  /** Issued via ACME (Let's Encrypt); renews automatically over HTTP-01. */
+  acme?: boolean
 }
 
 export interface AccessLog {
@@ -108,6 +110,8 @@ export interface DashboardSummary {
   tls_certificates: number
   healthy_upstreams: number
   total_upstreams: number
+  pv_24h: number
+  uv_24h: number
 }
 
 export interface TrafficPoint {
@@ -127,6 +131,12 @@ export interface DashboardTraffic {
   top_routes: TopRoute[]
 }
 
+/** Request count by visitor country (GeoIP). `country` is ISO alpha-2 or "??". */
+export interface CountryStat {
+  country: string
+  requests: number
+}
+
 export interface MetricPoint {
   t: string
   value: number
@@ -138,6 +148,19 @@ export interface MetricSeries {
   unit: string
   current: number
   series: MetricPoint[]
+}
+
+/** 24h analytics for a host+path (or whole proxy). */
+export interface RouteStats {
+  window_hours: number
+  pv: number
+  uv: number
+  current_qps: number
+  error_rate: number
+  latency_p50: number
+  latency_p99: number
+  qps_series: MetricPoint[]
+  countries: CountryStat[]
 }
 
 export interface AcmeSettings {

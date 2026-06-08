@@ -135,6 +135,33 @@ async fn proxy_handler(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| peer.ip().to_string());
 
+    // --- ACME HTTP-01 challenge ---------------------------------------------
+    // Served BEFORE any routing/redirect so certificate issuance never disrupts
+    // the origin site: only the exact `/.well-known/acme-challenge/<token>` path
+    // is intercepted, and only while that token is an active challenge. Every
+    // other request (and any unknown token) falls through to normal proxying.
+    if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+        if let Some(key_auth) = state.acme_challenges.lock().get(token).cloned() {
+            log_request(
+                &state,
+                &client_ip,
+                &method,
+                &host,
+                &path,
+                200,
+                started,
+                "acme-http-01",
+                WafAction::Allow,
+            );
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                key_auth,
+            )
+                .into_response();
+        }
+    }
+
     // --- Routing + load balancing (single store lock, also decides redirect) -
     let (upstream_name, address, waf_enabled, default_waf) =
         match pick_target(&state, &host, &path, &client_ip, secure) {

@@ -9,7 +9,7 @@
 //!   -32602 invalid params · -32603 internal error · -32004 not found (custom)
 
 use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -214,18 +214,43 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
 
         // ---- Dashboard (derived from real request logs + config) ----
         "dashboard.summary" => {
-            let logs = state.logs.lock();
-            let events = state.waf_events.lock();
+            // Read the cheap config-derived counts, then release the global store
+            // lock *before* the log scan so the proxy data plane (which also takes
+            // store on every request) isn't blocked by it.
+            let waf_blocks = state.waf_events.lock().total_deny();
+            let tls_certificates = store.certs.len() as u32;
+            let healthy_upstreams = store
+                .upstreams
+                .iter()
+                .filter(|u| matches!(u.status, fluxgate_core::UpstreamStatus::Healthy))
+                .count() as u32;
+            let total_upstreams = store.upstreams.len() as u32;
             let inflight = state.inflight.load(Ordering::SeqCst);
+            drop(store);
+            let (snap, total_requests) = {
+                let g = state.logs.lock();
+                (g.snapshot(), g.total())
+            };
             ok(collector::dashboard_summary(
-                &store, &logs, &events, inflight,
+                &snap,
+                Utc::now(),
+                collector::SummaryConfig {
+                    waf_blocks,
+                    tls_certificates,
+                    healthy_upstreams,
+                    total_upstreams,
+                    total_requests,
+                    inflight,
+                },
             ))
         }
         "dashboard.traffic" => {
-            let logs = state.logs.lock();
+            // No store needed — release it before scanning logs.
+            drop(store);
+            let snap = state.logs.lock().snapshot();
             ok(json!({
-                "points": collector::traffic_points(&logs),
-                "top_routes": collector::top_routes(&logs),
+                "points": collector::traffic_points(&snap),
+                "top_routes": collector::top_routes(&snap),
             }))
         }
         "dashboard.security_events" => {
@@ -233,6 +258,21 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             let mut events = state.waf_events.lock().snapshot();
             events.truncate(limit);
             ok(events)
+        }
+        "dashboard.countries" => {
+            // Visitor countries over 24h (GeoIP on the client IP). Release the
+            // store lock, snapshot the logs, then resolve countries outside both.
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+            drop(store);
+            let snap = state.logs.lock().snapshot();
+            let stats = collector::window_stats(
+                &snap,
+                Utc::now(),
+                |_| true,
+                |ip| state.waf.country_of(ip),
+                limit,
+            );
+            ok(stats.countries)
         }
 
         // ---- Sites (hosts) ----
@@ -626,49 +666,86 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 .unwrap_or_else(|| Err(RpcError::not_found(format!("certificate {}", p.id))))
         }
         "tls.cert.request" => {
-            // Generates a REAL self-signed keypair + X.509 cert (local issuer).
-            // A real ACME client would replace this call's body; the rest of the
-            // pipeline (storage, status, renewal) stays identical.
+            // When ACME is enabled (and ToS agreed), order a real certificate
+            // from the configured CA over HTTP-01. Issuance runs in the
+            // background (it can take 10-60s and must not block the RPC nor hold
+            // the store lock), so we insert a `Pending` entry and return at once;
+            // the cert flips to `Valid` when the order completes. Otherwise we
+            // generate a local self-signed certificate as before.
             let p: DomainParam = parse(params)?;
             let id = short_id("ct");
-            let (cert_pem, key_pem, expires) = crate::tls::generate_self_signed(&p.domain, 90)
-                .map_err(|e| {
-                    RpcError::new(-32603, format!("certificate generation failed: {e}"))
-                })?;
-            crate::tls::save_files(&state.config.cert_dir, &id, &cert_pem, Some(&key_pem))
-                .map_err(|e| RpcError::new(-32603, format!("could not write cert files: {e}")))?;
-            let cert = TlsCertificate {
-                id: id.clone(),
-                domain: p.domain,
-                issuer: "FluxGate self-signed (local)".into(),
-                expires_at: expires.to_rfc3339(),
-                auto_renew: true,
-                status: crate::tls::status_for(&expires),
-            };
-            store.certs.insert(0, cert.clone());
-            audit("tls.cert.request", &id);
-            ok(cert)
+            let acme_on = store.settings.acme.enabled && store.settings.acme.agree_tos;
+            if acme_on {
+                let cert = TlsCertificate {
+                    id: id.clone(),
+                    domain: p.domain.clone(),
+                    issuer: "Let's Encrypt (issuing…)".into(),
+                    expires_at: Utc::now().to_rfc3339(),
+                    auto_renew: true,
+                    status: CertStatus::Pending,
+                    acme: true,
+                };
+                store.certs.insert(0, cert.clone());
+                audit("tls.cert.request", &id);
+                spawn_acme_issue(state.clone(), id, p.domain);
+                ok(cert)
+            } else {
+                let (cert_pem, key_pem, expires) = crate::tls::generate_self_signed(&p.domain, 90)
+                    .map_err(|e| {
+                        RpcError::new(-32603, format!("certificate generation failed: {e}"))
+                    })?;
+                crate::tls::save_files(&state.config.cert_dir, &id, &cert_pem, Some(&key_pem))
+                    .map_err(|e| {
+                        RpcError::new(-32603, format!("could not write cert files: {e}"))
+                    })?;
+                let cert = TlsCertificate {
+                    id: id.clone(),
+                    domain: p.domain,
+                    issuer: "FluxGate self-signed (local)".into(),
+                    expires_at: expires.to_rfc3339(),
+                    auto_renew: true,
+                    status: crate::tls::status_for(&expires),
+                    acme: false,
+                };
+                store.certs.insert(0, cert.clone());
+                audit("tls.cert.request", &id);
+                ok(cert)
+            }
         }
         "tls.cert.renew" => {
-            // Re-issue a fresh real keypair/cert for the same domain.
+            // ACME certs re-issue over HTTP-01 in the background; self-signed
+            // certs are re-generated locally and synchronously as before.
             let p: IdParam = parse(params)?;
-            // Single mutable lookup — no second find / `expect`. The cert borrow
-            // is held across generate/save (neither touches the store).
             let c = store
                 .certs
                 .iter_mut()
                 .find(|c| c.id == p.id)
                 .ok_or_else(|| RpcError::not_found(format!("certificate {}", p.id)))?;
-            let (cert_pem, key_pem, expires) = crate::tls::generate_self_signed(&c.domain, 90)
-                .map_err(|e| RpcError::new(-32603, format!("renewal failed: {e}")))?;
-            crate::tls::save_files(&state.config.cert_dir, &p.id, &cert_pem, Some(&key_pem))
-                .map_err(|e| RpcError::new(-32603, format!("could not write cert files: {e}")))?;
-            c.expires_at = expires.to_rfc3339();
-            c.issuer = "FluxGate self-signed (local)".into();
-            c.status = crate::tls::status_for(&expires);
-            let out = c.clone();
-            audit("tls.cert.renew", &p.id);
-            ok(out)
+            if c.acme {
+                // Re-issue in the background. Show `Pending` while it runs, but
+                // leave the issuer/expiry intact so a transient failure can't
+                // destroy the still-valid cert (finish_acme restores the status
+                // from the stored expiry on failure).
+                let (id, domain) = (c.id.clone(), c.domain.clone());
+                c.status = CertStatus::Pending;
+                let out = c.clone();
+                spawn_acme_issue(state.clone(), id, domain);
+                audit("tls.cert.renew", &p.id);
+                ok(out)
+            } else {
+                let (cert_pem, key_pem, expires) = crate::tls::generate_self_signed(&c.domain, 90)
+                    .map_err(|e| RpcError::new(-32603, format!("renewal failed: {e}")))?;
+                crate::tls::save_files(&state.config.cert_dir, &p.id, &cert_pem, Some(&key_pem))
+                    .map_err(|e| {
+                        RpcError::new(-32603, format!("could not write cert files: {e}"))
+                    })?;
+                c.expires_at = expires.to_rfc3339();
+                c.issuer = "FluxGate self-signed (local)".into();
+                c.status = crate::tls::status_for(&expires);
+                let out = c.clone();
+                audit("tls.cert.renew", &p.id);
+                ok(out)
+            }
         }
         "tls.cert.upload" => {
             // Parse the REAL uploaded PEM: subject/issuer/expiry come from the cert.
@@ -689,6 +766,7 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 expires_at: parsed.not_after.to_rfc3339(),
                 auto_renew: p.auto_renew.unwrap_or(false),
                 status: crate::tls::status_for(&parsed.not_after),
+                acme: false,
             };
             store.certs.insert(0, cert.clone());
             audit("tls.cert.upload", &id);
@@ -709,11 +787,13 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
         // ---- Access logs (real requests served by this process) ----
         "access_log.list" => {
             let p: LogQuery = parse_or_default(params)?;
+            drop(store);
             let logs = state.logs.lock().snapshot();
             ok(paginate(&logs, p.offset, p.limit.unwrap_or(50)))
         }
         "access_log.search" => {
             let p: LogQuery = parse_or_default(params)?;
+            drop(store);
             let snap = state.logs.lock().snapshot();
             let filtered: Vec<AccessLog> =
                 snap.into_iter().filter(|l| log_matches(l, &p)).collect();
@@ -726,14 +806,27 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
         // ---- Metrics (real host telemetry + derived request metrics) ----
         "metrics.system" => ok(state.telemetry.lock().metrics_system()),
         "metrics.traffic" => {
-            let logs = state.logs.lock();
-            ok(collector::metrics_traffic(&logs))
+            drop(store);
+            let snap = state.logs.lock().snapshot();
+            ok(collector::metrics_traffic(&snap))
         }
         "metrics.route" => {
+            // 24h analytics for one host+path (PV/UV/QPS/latency/error/countries).
+            // Release store, snapshot under the logs lock; analysis + GeoIP run
+            // outside both locks.
             let p: RouteMetricsParam = parse(params)?;
-            let logs = state.logs.lock();
             let path = p.path.unwrap_or_else(|| "/".into());
-            ok(collector::metrics_route(&logs, &p.host, &path))
+            let host = p.host;
+            drop(store);
+            let snap = state.logs.lock().snapshot();
+            let stats = collector::window_stats(
+                &snap,
+                Utc::now(),
+                |l| l.host.eq_ignore_ascii_case(&host) && l.path.starts_with(&path),
+                |ip| state.waf.country_of(ip),
+                10,
+            );
+            ok(stats)
         }
         "metrics.upstream" => ok(collector::metrics_upstream(&store)),
         "metrics.waf" => {
@@ -895,6 +988,94 @@ fn audit(action: &str, target: &str) {
 fn short_id(prefix: &str) -> String {
     let u = uuid::Uuid::new_v4().simple().to_string();
     format!("{prefix}-{}", &u[..8])
+}
+
+/// Run an ACME HTTP-01 order in the background for an existing `Pending` cert
+/// entry, then update it to `Valid` (with the real expiry/issuer) on success, or
+/// mark it failed on error. Also used by the auto-renewal task.
+pub fn spawn_acme_issue(state: AppState, id: String, domain: String) {
+    tokio::spawn(async move {
+        let (dir_url, email) = {
+            let store = state.store.lock();
+            (
+                store.settings.acme.directory_url.clone(),
+                store.settings.acme.email.clone(),
+            )
+        };
+        let dir = state.config.cert_dir.clone();
+        tracing::info!("ACME: ordering certificate for {domain} (id {id})");
+        match crate::acme::issue_http01(&dir, &dir_url, &email, &domain, &state.acme_challenges)
+            .await
+        {
+            Ok((cert_pem, key_pem)) => {
+                if let Err(e) = crate::tls::save_files(&dir, &id, &cert_pem, Some(&key_pem)) {
+                    tracing::error!("ACME: issued {domain} but could not write files: {e}");
+                    finish_acme(&state, &id, None, "ACME issued, but file write failed");
+                    return;
+                }
+                let parsed = crate::tls::parse_pem(&cert_pem).ok();
+                let expires = parsed
+                    .as_ref()
+                    .map(|p| p.not_after)
+                    .unwrap_or_else(|| Utc::now() + chrono::Duration::days(90));
+                let issuer = parsed
+                    .map(|p| p.issuer)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "Let's Encrypt".into());
+                finish_acme(&state, &id, Some((expires, issuer)), "");
+                tracing::info!("ACME: certificate for {domain} issued (valid until {expires})");
+            }
+            Err(e) => {
+                tracing::error!("ACME: issuance for {domain} failed: {e:#}");
+                finish_acme(
+                    &state,
+                    &id,
+                    None,
+                    "ACME issuance failed — check DNS + port 80",
+                );
+            }
+        }
+    });
+}
+
+/// Apply the outcome of an ACME order to the stored cert entry and persist.
+/// `Some((expires, issuer))` → success (Valid); `None` → failure (Expired + the
+/// failure reason as the issuer, so it surfaces in the UI).
+fn finish_acme(state: &AppState, id: &str, ok: Option<(DateTime<Utc>, String)>, fail_reason: &str) {
+    let mut store = state.store.lock();
+    if let Some(c) = store.certs.iter_mut().find(|c| c.id == id) {
+        match ok {
+            Some((expires, issuer)) => {
+                c.expires_at = expires.to_rfc3339();
+                c.issuer = issuer;
+                c.status = crate::tls::status_for(&expires);
+                c.acme = true;
+            }
+            // Failure: never destroy a certificate that still has a usable cert
+            // on disk. If the existing entry is still within its validity window
+            // (a renewal that failed transiently), keep serving it — just restore
+            // its real status from the stored expiry and leave the issuer intact.
+            // Only a brand-new request that never obtained a cert (no future
+            // expiry) is surfaced as failed.
+            None => match crate::tls::parse_dt(&c.expires_at) {
+                // Existing cert is still within its validity window — a renewal
+                // that failed transiently. Keep serving it; just restore the real
+                // status and leave the issuer/expiry untouched.
+                Some(dt) if crate::tls::status_for(&dt) != CertStatus::Expired => {
+                    c.status = crate::tls::status_for(&dt);
+                    tracing::warn!(
+                        "ACME renewal for cert {id} failed ({fail_reason}); keeping the existing valid certificate"
+                    );
+                }
+                // No usable cert (a fresh request that never obtained one) — surface the failure.
+                _ => {
+                    c.status = CertStatus::Expired;
+                    c.issuer = fail_reason.to_string();
+                }
+            },
+        }
+    }
+    crate::persist::save(&state.config.data_path, &store);
 }
 
 fn ok<T: Serialize>(value: T) -> RpcResult {

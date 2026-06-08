@@ -2,8 +2,12 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
+  Cell,
+  Legend,
   Line,
   LineChart,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -122,6 +126,54 @@ export function Sparkline({ data, color = 'brand', height = 48 }: SparklineProps
         </defs>
         <Area type="monotone" dataKey="value" stroke={COLORS[color]} strokeWidth={1.8} fill={`url(#spark-${color})`} dot={false} isAnimationActive={false} />
       </AreaChart>
+    </ResponsiveContainer>
+  )
+}
+
+const PIE_COLORS = ['#2563eb', '#7c3aed', '#059669', '#d97706', '#dc2626', '#0891b2', '#db2777', '#65a30d', '#94a3b8']
+
+interface DonutSlice {
+  name: string
+  value: number
+}
+
+interface DonutChartProps {
+  data: DonutSlice[]
+  height?: number
+  /** Optional formatter for the displayed name (e.g. country code → flag+name). */
+  labelOf?: (name: string) => string
+}
+
+/** Donut chart for categorical distribution (e.g. visitor countries). */
+export function DonutChart({ data, height = 240, labelOf }: DonutChartProps) {
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+  const text = isDark ? '#cbd5e1' : '#475569'
+  const total = data.reduce((s, d) => s + d.value, 0) || 1
+  const fmt = (n: string) => (labelOf ? labelOf(n) : n)
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <PieChart>
+        <Pie
+          data={data}
+          dataKey="value"
+          nameKey="name"
+          innerRadius="55%"
+          outerRadius="80%"
+          paddingAngle={1.5}
+          stroke="none"
+          isAnimationActive={false}
+        >
+          {data.map((_, i) => (
+            <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+          ))}
+        </Pie>
+        <Tooltip
+          formatter={(value: number, name: string) => [`${value.toLocaleString()} (${((value / total) * 100).toFixed(1)}%)`, fmt(name)]}
+          contentStyle={{ background: isDark ? '#1e293b' : '#fff', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8, fontSize: 12 }}
+        />
+        <Legend formatter={(name: string) => <span style={{ color: text, fontSize: 12 }}>{fmt(name)}</span>} iconType="circle" iconSize={8} />
+      </PieChart>
     </ResponsiveContainer>
   )
 }

@@ -191,7 +191,8 @@ pub fn default_waf_rules() -> Vec<WafRule> {
         mk(
             "waf-default-geo",
             "Geo block (template)",
-            "Example GeoIP rule — requires a GeoIP database to take effect; disabled by default.",
+            "GeoIP rule (`country in [..]` / `not in` / `==`). Active when a MaxMind \
+             .mmdb is configured via FLUXGATE_GEOIP_DB; disabled by default.",
             Geo,
             "country in [KP, SY]",
             Deny,

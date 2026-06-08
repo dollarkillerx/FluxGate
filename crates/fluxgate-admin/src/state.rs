@@ -37,6 +37,8 @@ pub struct Config {
     /// Retention window in days for access logs / WAF events. Older entries are
     /// pruned periodically from both memory and disk.
     pub retention_days: i64,
+    /// Optional GeoIP `.mmdb` path enabling `geo` WAF rules (`None` = disabled).
+    pub geoip_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -58,6 +60,9 @@ pub struct AppState {
     pub proxy_client: Arc<crate::proxy::ProxyClient>,
     /// Round-robin cursor per upstream id (load balancing state).
     pub lb_cursor: Arc<Mutex<HashMap<String, usize>>>,
+    /// In-flight ACME HTTP-01 challenges (token → key authorization), served by
+    /// the proxy at `/.well-known/acme-challenge/<token>`.
+    pub acme_challenges: crate::acme::ChallengeStore,
 }
 
 impl AppState {
@@ -100,8 +105,16 @@ impl AppState {
         if dirty {
             crate::persist::save(&config.data_path, &store);
         }
-        // Compile the WAF rules once up front (priority-sorted, regexes built).
-        let waf = Arc::new(WafEngine::new());
+        // Load the GeoIP DB (if configured) and compile the WAF rules once.
+        let geo = config.geoip_path.as_ref().and_then(|p| {
+            let r = WafEngine::load_geoip(p);
+            match &r {
+                Some(_) => tracing::info!("GeoIP database loaded from {}", p.display()),
+                None => tracing::warn!("GeoIP database at {} could not be read", p.display()),
+            }
+            r
+        });
+        let waf = Arc::new(WafEngine::new(geo));
         waf.rebuild(&store.waf_rules);
         // Capture buffer paths before `config` is moved into the Arc.
         let log_path = config.log_path.clone();
@@ -110,12 +123,15 @@ impl AppState {
             config: Arc::new(config),
             store: Arc::new(Mutex::new(store)),
             telemetry: Arc::new(Mutex::new(Telemetry::new())),
-            logs: Arc::new(Mutex::new(LogBuffer::new(1000, log_path))),
+            // Larger ring so the 24h dashboard/route analytics have history to
+            // work with (≈5 MB at 20k entries).
+            logs: Arc::new(Mutex::new(LogBuffer::new(20_000, log_path))),
             waf,
             waf_events: Arc::new(Mutex::new(EventBuffer::new(500, event_path))),
             inflight: Arc::new(AtomicI64::new(0)),
             proxy_client: Arc::new(crate::proxy::build_client()),
             lb_cursor: Arc::new(Mutex::new(HashMap::new())),
+            acme_challenges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

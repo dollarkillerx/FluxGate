@@ -4,6 +4,7 @@ import { Login } from '@/pages/Login'
 import { AppLayout } from '@/components/layout/AppLayout'
 import { Dashboard } from '@/pages/Dashboard'
 import { RoutesPage } from '@/pages/RoutesPage'
+import { RouteAnalyticsPage } from '@/pages/RouteAnalyticsPage'
 import { UpstreamsPage } from '@/pages/UpstreamsPage'
 import { WafRulesPage } from '@/pages/WafRulesPage'
 import { CertificatesPage } from '@/pages/CertificatesPage'
@@ -22,6 +23,7 @@ export default function App() {
       <Route element={<AppLayout />}>
         <Route path="/" element={<Dashboard />} />
         <Route path="/routes" element={<RoutesPage />} />
+        <Route path="/routes/analytics" element={<RouteAnalyticsPage />} />
         <Route path="/upstreams" element={<UpstreamsPage />} />
         <Route path="/waf" element={<WafRulesPage />} />
         <Route path="/certificates" element={<CertificatesPage />} />

@@ -154,6 +154,7 @@ pub fn default_self_signed_cert(dir: &Path) -> Result<TlsCertificate> {
         expires_at: expires.to_rfc3339(),
         auto_renew: true,
         status: status_for(&expires),
+        acme: false,
     })
 }
 

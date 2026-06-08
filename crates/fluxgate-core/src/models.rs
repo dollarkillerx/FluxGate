@@ -172,6 +172,10 @@ pub struct TlsCertificate {
     pub expires_at: String,
     pub auto_renew: bool,
     pub status: CertStatus,
+    /// Issued via ACME (Let's Encrypt) rather than self-signed/uploaded. Drives
+    /// automatic HTTP-01 renewal. Defaults to `false` for older stored data.
+    #[serde(default)]
+    pub acme: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +209,10 @@ pub struct DashboardSummary {
     pub tls_certificates: u32,
     pub healthy_upstreams: u32,
     pub total_upstreams: u32,
+    /// Page views (total requests) in the last 24 hours.
+    pub pv_24h: u64,
+    /// Unique visitors (distinct client IPs) in the last 24 hours.
+    pub uv_24h: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +227,32 @@ pub struct TopRoute {
     pub route: String,
     pub requests: u64,
     pub blocked: u64,
+}
+
+/// Request count grouped by visitor country (from GeoIP on the client IP).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CountryStat {
+    /// ISO-3166-1 alpha-2 code, or `"??"` for unknown / private addresses.
+    pub country: String,
+    pub requests: u64,
+}
+
+/// 24-hour analytics for a host+path (or the whole proxy), bucketed hourly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteStats {
+    pub window_hours: u32,
+    /// Page views = total requests in the window.
+    pub pv: u64,
+    /// Unique visitors = distinct client IPs in the window.
+    pub uv: u64,
+    pub current_qps: f64,
+    pub error_rate: f64,
+    pub latency_p50: f64,
+    pub latency_p99: f64,
+    /// 24 hourly points (oldest → newest).
+    pub qps_series: Vec<MetricPoint>,
+    /// Visitor-country breakdown (top N), for the pie chart.
+    pub countries: Vec<CountryStat>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

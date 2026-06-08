@@ -1,104 +1,20 @@
 import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Plus, Pencil, Trash2, Activity, Globe, ShieldCheck, Lock, ChevronRight } from 'lucide-react'
 import { useRpc } from '@/hooks/useRpc'
 import { rpc } from '@/api/rpc'
 import { useToast } from '@/context/ToastContext'
 import { useI18n } from '@/i18n/I18nContext'
-import type { Route, Site, Upstream, TlsCertificate, MetricSeries } from '@/types'
+import type { Route, Site, Upstream, TlsCertificate } from '@/types'
 import { PageHeader } from '@/components/ui/PageHeader'
-import { LiveIndicator } from '@/components/ui/LiveIndicator'
-import { Card, CardBody, CardHeader } from '@/components/ui/Card'
+import { Card, CardBody } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { Toggle } from '@/components/ui/Toggle'
 import { Modal } from '@/components/ui/Modal'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { Field, Input, Select } from '@/components/ui/Field'
-import { StateView, Spinner } from '@/components/ui/States'
-import { TrendChart } from '@/components/charts/Charts'
-
-const ANALYTICS_REFRESH_MS = 3000
-
-/** Merge MetricSeries (sharing an x-axis) into chart rows keyed by series key. */
-function mergeSeries(list: MetricSeries[], keys: string[]) {
-  const picked = list.filter((s) => keys.includes(s.key))
-  const len = picked[0]?.series.length ?? 0
-  return Array.from({ length: len }, (_, i) => {
-    const row: Record<string, number | string> = { t: picked[0]?.series[i]?.t ?? '' }
-    for (const s of picked) row[s.key] = s.series[i]?.value ?? 0
-    return row
-  })
-}
-
-/** Per-path traffic analytics (QPS / latency / error rate), auto-refreshing. */
-function RouteAnalytics({ host, path }: { host: string; path: string }) {
-  const { t } = useI18n()
-  const { data, error } = useRpc<MetricSeries[]>('metrics.route', { host, path }, [host, path], ANALYTICS_REFRESH_MS)
-
-  if (error) return <p className="py-8 text-center text-sm text-red-500">{error}</p>
-  if (!data) return <Spinner />
-
-  const by = (k: string) => data.find((s) => s.key === k)
-  const cards = ['qps', 'latency_p50', 'latency_p99', 'error_rate'] as const
-  const tones: Record<string, string> = {
-    qps: 'text-brand-600',
-    latency_p50: 'text-violet-600',
-    latency_p99: 'text-amber-600',
-    error_rate: 'text-red-500',
-  }
-  const hasTraffic = (by('qps')?.series ?? []).some((p) => p.value > 0)
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <p className="text-xs text-slate-500 dark:text-slate-400">{t('routes.analyticsWindow')}</p>
-        <LiveIndicator seconds={ANALYTICS_REFRESH_MS / 1000} />
-      </div>
-
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        {cards.map((k) => {
-          const m = by(k)
-          return (
-            <div key={k} className="rounded-lg border border-slate-200 p-3 dark:border-slate-700">
-              <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">{t(`metrics.label.${k}`)}</div>
-              <div className={`mt-1 text-xl font-semibold tabular-nums ${tones[k]}`}>
-                {(m?.current ?? 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}
-                <span className="ml-1 text-xs font-normal text-slate-400">{m?.unit}</span>
-              </div>
-            </div>
-          )
-        })}
-      </div>
-
-      {!hasTraffic && (
-        <p className="rounded-md bg-slate-50 py-3 text-center text-xs text-slate-400 dark:bg-slate-800/50">{t('routes.noTraffic')}</p>
-      )}
-
-      <Card>
-        <CardHeader title={t('metrics.label.qps')} />
-        <CardBody>
-          <TrendChart data={mergeSeries(data, ['qps'])} xKey="t" series={[{ key: 'qps', label: t('metrics.label.qps'), color: 'brand' }]} yFormatter={(v) => `${v}`} height={180} />
-        </CardBody>
-      </Card>
-      <Card>
-        <CardHeader title={t('routes.latencyTitle')} />
-        <CardBody>
-          <TrendChart
-            data={mergeSeries(data, ['latency_p50', 'latency_p99'])}
-            xKey="t"
-            area={false}
-            series={[
-              { key: 'latency_p50', label: 'p50', color: 'brand' },
-              { key: 'latency_p99', label: 'p99', color: 'red' },
-            ]}
-            yFormatter={(v) => `${v}ms`}
-            height={180}
-          />
-        </CardBody>
-      </Card>
-    </div>
-  )
-}
+import { StateView } from '@/components/ui/States'
 
 // ---------------------------------------------------------------------------
 // Site form
@@ -128,6 +44,9 @@ interface RouteForm {
 export function RoutesPage() {
   const toast = useToast()
   const { t } = useI18n()
+  const navigate = useNavigate()
+  const openAnalytics = (host: string, path: string) =>
+    navigate(`/routes/analytics?host=${encodeURIComponent(host)}&path=${encodeURIComponent(path)}`)
   const sites = useRpc<Site[]>('site.list')
   const routes = useRpc<Route[]>('route.list')
   const upstreams = useRpc<Upstream[]>('upstream.list')
@@ -138,7 +57,6 @@ export function RoutesPage() {
   const [saving, setSaving] = useState(false)
   const [siteToDelete, setSiteToDelete] = useState<Site | null>(null)
   const [routeToDelete, setRouteToDelete] = useState<Route | null>(null)
-  const [analyze, setAnalyze] = useState<{ host: string; path: string } | null>(null)
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const toggleExpand = (id: string) => setExpanded((e) => ({ ...e, [id]: !e[id] }))
 
@@ -296,7 +214,7 @@ export function RoutesPage() {
                           {paths.map((r) => (
                             <tr key={r.id} className="border-b border-slate-50 last:border-0 dark:border-slate-800/50">
                               <td className="px-4 py-2.5">
-                                <button type="button" onClick={() => setAnalyze({ host: site.host, path: r.path })} className="font-mono text-xs text-slate-700 hover:text-brand-600 dark:text-slate-200" title={t('routes.analyze')}>
+                                <button type="button" onClick={() => openAnalytics(site.host, r.path)} className="font-mono text-xs text-slate-700 hover:text-brand-600 dark:text-slate-200" title={t('routes.analyze')}>
                                   {r.path}
                                 </button>
                                 {r.name && <span className="ml-2 text-xs text-slate-400">{r.name}</span>}
@@ -306,7 +224,7 @@ export function RoutesPage() {
                               <td className="px-4 py-2.5"><Toggle checked={r.enabled} onChange={(v) => toggleRoute(r, v)} aria-label="Toggle path" /></td>
                               <td className="px-4 py-2.5">
                                 <div className="flex justify-end gap-1">
-                                  <Button variant="ghost" size="sm" icon={<Activity size={14} />} onClick={() => setAnalyze({ host: site.host, path: r.path })} aria-label={t('routes.analyze')} />
+                                  <Button variant="ghost" size="sm" icon={<Activity size={14} />} onClick={() => openAnalytics(site.host, r.path)} aria-label={t('routes.analyze')} />
                                   <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => setRouteForm({ id: r.id, site_id: r.site_id, path: r.path, upstream: r.upstream, waf_enabled: r.waf_enabled, enabled: r.enabled })} aria-label={t('common.edit')} />
                                   <Button variant="ghost" size="sm" icon={<Trash2 size={14} className="text-red-500" />} onClick={() => setRouteToDelete(r)} aria-label={t('common.delete')} />
                                 </div>
@@ -411,16 +329,6 @@ export function RoutesPage() {
             </div>
           </div>
         )}
-      </Modal>
-
-      {/* Per-path analytics modal */}
-      <Modal
-        open={!!analyze}
-        onClose={() => setAnalyze(null)}
-        title={analyze ? t('routes.analyticsTitle', { host: `${analyze.host}${analyze.path}` }) : ''}
-        size="lg"
-      >
-        {analyze && <RouteAnalytics host={analyze.host} path={analyze.path} />}
       </Modal>
 
       <ConfirmDialog

@@ -30,6 +30,8 @@ fluxgate-data.json.tmp
 fluxgate-certs/
 fluxgate-access.log
 fluxgate-events.log
+fluxgate-geoip/
+*.mmdb
 
 *.local
 .DS_Store

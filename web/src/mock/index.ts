@@ -12,6 +12,7 @@ import type {
   AccessLog,
   DashboardSummary,
   MetricSeries,
+  RouteStats,
   Route,
   Site,
   SecurityEvent,
@@ -217,6 +218,36 @@ function summary(): DashboardSummary {
     tls_certificates: certs.length,
     healthy_upstreams: upstreams.filter((x) => x.status === 'healthy').length,
     total_upstreams: upstreams.length,
+    pv_24h: 4820177,
+    uv_24h: 318204,
+  }
+}
+
+const MOCK_COUNTRIES = [
+  { country: 'US', requests: 48201 },
+  { country: 'CN', requests: 31980 },
+  { country: 'DE', requests: 12044 },
+  { country: 'JP', requests: 9821 },
+  { country: 'GB', requests: 7330 },
+  { country: 'FR', requests: 5210 },
+  { country: '??', requests: 4102 },
+]
+
+function routeStats(): RouteStats {
+  const qps_series = Array.from({ length: 24 }, (_, i) => ({
+    t: `-${24 - i - 1}h`,
+    value: Math.round(Math.max(0, 1.2 + (wobble(700 + i) - 0.5) * 1.6) * 100) / 100,
+  }))
+  return {
+    window_hours: 24,
+    pv: 184203,
+    uv: 21044,
+    current_qps: qps_series[qps_series.length - 1].value,
+    error_rate: 0.7,
+    latency_p50: 16,
+    latency_p99: 92,
+    qps_series,
+    countries: MOCK_COUNTRIES,
   }
 }
 
@@ -229,6 +260,7 @@ const handlers: Record<string, (p: Params) => unknown> = {
   'dashboard.summary': () => summary(),
   'dashboard.traffic': () => ({ points: trafficSeries(), top_routes: TOP_ROUTES }),
   'dashboard.security_events': (p) => events.slice(0, p.limit ?? 8),
+  'dashboard.countries': (p) => MOCK_COUNTRIES.slice(0, p.limit ?? 12),
 
   'site.list': () => sites,
   'site.get': (p) => find(sites, p.id, 'site'),
@@ -364,6 +396,7 @@ const handlers: Record<string, (p: Params) => unknown> = {
     metric('blocks', 'WAF Blocks', 'blocks/min', 320, 200, 1010),
     metric('challenges', 'Challenges', 'ch/min', 140, 90, 1111),
   ],
+  'metrics.route': () => routeStats(),
 
   'settings.get': () => settings,
   'settings.update': (p) => {

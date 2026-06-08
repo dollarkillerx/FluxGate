@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import {
   Activity,
   ShieldAlert,
@@ -6,27 +7,46 @@ import {
   Lock,
   Server,
   ArrowUpRight,
+  Eye,
+  UserCheck,
 } from 'lucide-react'
 import { useRpc } from '@/hooks/useRpc'
 import { useI18n } from '@/i18n/I18nContext'
-import type { DashboardSummary, DashboardTraffic, SecurityEvent } from '@/types'
+import type { CountryStat, DashboardSummary, DashboardTraffic, SecurityEvent } from '@/types'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { LiveIndicator } from '@/components/ui/LiveIndicator'
 import { StatCard } from '@/components/ui/StatCard'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Spinner, ErrorState } from '@/components/ui/States'
-import { TrendChart } from '@/components/charts/Charts'
-import { formatFull, formatNumber, timeAgo } from '@/lib/utils'
+import { TrendChart, DonutChart } from '@/components/charts/Charts'
+import { formatFull, formatNumber, timeAgo, flag } from '@/lib/utils'
 import { wafActionTone } from '@/lib/status'
 
 const REFRESH_MS = 5000
 
 export function Dashboard() {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const summary = useRpc<DashboardSummary>('dashboard.summary', {}, [], REFRESH_MS)
   const traffic = useRpc<DashboardTraffic>('dashboard.traffic', {}, [], REFRESH_MS)
   const events = useRpc<SecurityEvent[]>('dashboard.security_events', { limit: 6 }, [], REFRESH_MS)
+  const countries = useRpc<CountryStat[]>('dashboard.countries', { limit: 12 }, [], REFRESH_MS)
+
+  // Build the Intl formatter once per locale (not on every render). F1 fix.
+  const regionNames = useMemo(() => {
+    try {
+      return new Intl.DisplayNames([locale], { type: 'region' })
+    } catch {
+      return null
+    }
+  }, [locale])
+  const countryName = (cc: string) =>
+    cc === '??' || !/^[A-Za-z]{2}$/.test(cc) ? t('dashboard.unknownCountry') : (regionNames?.of(cc.toUpperCase()) ?? cc)
+
+  const countryPie = useMemo(
+    () => (countries.data ?? []).map((c) => ({ name: c.country, value: c.requests })),
+    [countries.data],
+  )
 
   return (
     <div>
@@ -55,6 +75,8 @@ export function Dashboard() {
             icon={<Server size={18} />}
             accent={summary.data.healthy_upstreams === summary.data.total_upstreams ? 'emerald' : 'amber'}
           />
+          <StatCard label={t('dashboard.pv24h')} value={formatNumber(summary.data.pv_24h)} sub={t('dashboard.pvSub')} icon={<Eye size={18} />} accent="brand" />
+          <StatCard label={t('dashboard.uv24h')} value={formatNumber(summary.data.uv_24h)} sub={t('dashboard.uvSub')} icon={<UserCheck size={18} />} accent="violet" />
         </div>
       ) : null}
 
@@ -153,6 +175,49 @@ export function Dashboard() {
               </div>
             ) : (
               <Spinner />
+            )}
+          </CardBody>
+        </Card>
+      </div>
+
+      {/* Visitor countries (GeoIP) */}
+      <div className="mt-4">
+        <Card>
+          <CardHeader title={t('dashboard.countries')} description={t('dashboard.countriesDesc')} />
+          <CardBody>
+            {countries.error && !countries.data ? (
+              <ErrorState message={countries.error} onRetry={countries.refetch} />
+            ) : !countries.data ? (
+              <Spinner />
+            ) : countries.data.length === 0 ? (
+              <p className="py-8 text-center text-sm text-slate-400">{t('dashboard.noGeo')}</p>
+            ) : (
+              <div className="grid grid-cols-1 items-center gap-6 lg:grid-cols-2">
+                <DonutChart
+                  data={countryPie}
+                  height={280}
+                  labelOf={(cc) => `${flag(cc)} ${countryName(cc)}`}
+                />
+                <div className="space-y-3">
+                  {countries.data.slice(0, 8).map((c) => {
+                    const max = countries.data![0].requests || 1
+                    return (
+                      <div key={c.country}>
+                        <div className="flex items-center justify-between text-sm">
+                          <span className="flex min-w-0 items-center gap-2">
+                            <span className="text-base leading-none">{flag(c.country)}</span>
+                            <span className="truncate font-medium text-slate-700 dark:text-slate-200">{countryName(c.country)}</span>
+                          </span>
+                          <span className="shrink-0 tabular-nums text-slate-500 dark:text-slate-400">{formatNumber(c.requests)}</span>
+                        </div>
+                        <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                          <div className="h-full rounded-full bg-violet-500" style={{ width: `${(c.requests / max) * 100}%` }} />
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
             )}
           </CardBody>
         </Card>

@@ -22,6 +22,7 @@
 //! Ports 80/443 are privileged — run with sudo, or point the proxy at high
 //! ports (e.g. `FLUXGATE_PROXY_ADDR=0.0.0.0:8080 FLUXGATE_PROXY_TLS_ADDR=0.0.0.0:8443`).
 
+mod acme;
 mod assets;
 mod auth;
 mod challenge;
@@ -71,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
             .parse()
             .unwrap_or(6)
             .max(1),
+        geoip_path: resolve_geoip_path(),
     };
     if let Err(e) = std::fs::create_dir_all(&config.cert_dir) {
         tracing::warn!(
@@ -177,6 +179,41 @@ fn spawn_background_tasks(state: AppState) {
             .await
             {
                 tracing::warn!("upstream health probe task failed: {e}");
+            }
+        }
+    });
+
+    // ACME auto-renewal: every 12h, re-issue ACME-managed certificates that are
+    // within 30 days of expiry (and still have auto_renew on) over HTTP-01. The
+    // renewal reuses the persisted account; a pending re-issue swaps in the new
+    // cert/key files on success without interrupting the current one.
+    let renew_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(12 * 3600));
+        loop {
+            ticker.tick().await;
+            // Only renew when ACME is enabled and the operator agreed to the ToS.
+            let due: Vec<(String, String)> = {
+                let store = renew_state.store.lock();
+                if !(store.settings.acme.enabled && store.settings.acme.agree_tos) {
+                    Vec::new()
+                } else {
+                    store
+                        .certs
+                        .iter()
+                        .filter(|c| c.acme && c.auto_renew)
+                        .filter(|c| {
+                            tls::parse_dt(&c.expires_at)
+                                .map(|dt| (dt - Utc::now()).num_days() <= 30)
+                                .unwrap_or(false)
+                        })
+                        .map(|c| (c.id.clone(), c.domain.clone()))
+                        .collect()
+                }
+            };
+            for (id, domain) in due {
+                tracing::info!("ACME: auto-renewing {domain} (id {id})");
+                rpc::spawn_acme_issue(renew_state.clone(), id, domain);
             }
         }
     });
@@ -289,6 +326,68 @@ fn resolve_addr_env(var: &str, default: &str) -> Option<SocketAddr> {
         Err(e) => {
             tracing::error!("invalid {var} '{raw}': {e}");
             None
+        }
+    }
+}
+
+/// GeoIP database path:
+/// * `FLUXGATE_GEOIP_DB` set to a path → use it (no auto-download).
+/// * set to empty → disabled.
+/// * unset → default `fluxgate-geoip/GeoLite2-Country.mmdb`; if missing, it's
+///   **auto-downloaded** from the P3TERX/GeoLite.mmdb mirror (best effort).
+fn resolve_geoip_path() -> Option<PathBuf> {
+    match std::env::var("FLUXGATE_GEOIP_DB") {
+        Ok(v) if v.is_empty() => return None,
+        Ok(v) => return Some(PathBuf::from(v)),
+        Err(_) => {}
+    }
+    let default = PathBuf::from("fluxgate-geoip/GeoLite2-Country.mmdb");
+    if default.exists() {
+        return Some(default);
+    }
+    match download_geoip(&default) {
+        Ok(()) => Some(default),
+        Err(e) => {
+            tracing::warn!("GeoIP auto-download failed: {e} — `geo` rules disabled");
+            None
+        }
+    }
+}
+
+/// Fetch the GeoLite2-Country database from the P3TERX mirror to `dest`
+/// (atomic via a temp file). Blocking; only runs once, at first start.
+fn download_geoip(dest: &std::path::Path) -> anyhow::Result<()> {
+    const URL: &str =
+        "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb";
+    tracing::info!("GeoIP database not found — downloading from P3TERX/GeoLite.mmdb …");
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = dest.with_extension("mmdb.tmp");
+    let fetch = || -> anyhow::Result<u64> {
+        let agent = ureq::builder()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(45))
+            .build();
+        let resp = agent.get(URL).call()?;
+        let mut file = std::fs::File::create(&tmp)?;
+        let bytes = std::io::copy(&mut resp.into_reader(), &mut file)?;
+        file.sync_all().ok();
+        Ok(bytes)
+    };
+    match fetch() {
+        Ok(bytes) => {
+            std::fs::rename(&tmp, dest)?;
+            tracing::info!(
+                "GeoIP database downloaded ({} KB) → {}",
+                bytes / 1024,
+                dest.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp); // don't leave a partial behind
+            Err(e)
         }
     }
 }

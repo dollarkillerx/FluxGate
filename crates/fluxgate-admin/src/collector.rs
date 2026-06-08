@@ -3,7 +3,7 @@
 //! * `Telemetry`  — samples real host CPU / memory / network via `sysinfo`.
 //! * `LogBuffer`  — a ring buffer of real HTTP requests served by this process.
 //! * free fns     — derive dashboard / metrics figures from those real sources,
-//!                  and probe upstream TCP reachability.
+//!   and probe upstream TCP reachability.
 //!
 //! Nothing here fabricates numbers. Quantities that would require a real proxy
 //! data plane (WAF hits, security events) are reported as empty/zero rather than
@@ -240,12 +240,6 @@ impl LogBuffer {
         self.entries.iter().cloned().collect()
     }
 
-    /// Borrow the entries without cloning (newest first). Used by the metric
-    /// derivations, which only read.
-    pub fn entries(&self) -> &VecDeque<AccessLog> {
-        &self.entries
-    }
-
     /// Drop entries older than `cutoff` from memory and the on-disk JSONL.
     /// Returns the number of disk lines removed.
     pub fn prune_older_than(&mut self, cutoff: DateTime<Utc>) -> u64 {
@@ -399,12 +393,12 @@ fn parse(ts: &str) -> Option<DateTime<Utc>> {
 /// first (index 0 = 23m ago … index 23 = the current minute). Each item's
 /// timestamp is parsed **exactly once** (vs. 24× when filtering per bucket), and
 /// the source collection is borrowed — no clone. `keep` pre-filters items.
-fn bucket_last_24m<T>(
-    items: &VecDeque<T>,
+fn bucket_last_24m<'a, T: 'a>(
+    items: impl IntoIterator<Item = &'a T>,
     now: DateTime<Utc>,
     time_of: impl Fn(&T) -> &str,
     keep: impl Fn(&T) -> bool,
-) -> Vec<Vec<&T>> {
+) -> Vec<Vec<&'a T>> {
     let mut buckets: Vec<Vec<&T>> = (0..24).map(|_| Vec::new()).collect();
     for it in items {
         if !keep(it) {
@@ -430,67 +424,173 @@ fn bucket_labels() -> &'static [String] {
     LABELS.get_or_init(|| (0..24).rev().map(|i| format!("-{}m", i)).collect())
 }
 
+/// Cheap config-derived counts, read under the `store` lock by the caller so the
+/// lock can be released before the (heavier) log scan in `dashboard_summary`.
+pub struct SummaryConfig {
+    pub waf_blocks: u64,
+    pub tls_certificates: u32,
+    pub healthy_upstreams: u32,
+    pub total_upstreams: u32,
+    pub total_requests: u64,
+    pub inflight: i64,
+}
+
+/// Build the dashboard KPI summary from an owned log `snap` in a **single pass**
+/// (each timestamp parsed once): QPS over the last 5s, plus PV / UV over the 24h
+/// window. Operates on a snapshot so no lock is held during the scan — the caller
+/// clones under the logs lock and releases it first.
 pub fn dashboard_summary(
-    store: &Store,
-    logs: &LogBuffer,
-    events: &EventBuffer,
-    inflight: i64,
+    snap: &[AccessLog],
+    now: DateTime<Utc>,
+    cfg: SummaryConfig,
 ) -> DashboardSummary {
-    let now = Utc::now();
-    // Count requests in the last 5s — parse each timestamp once, no clone.
-    let qps = logs
-        .entries()
-        .iter()
-        .filter(|l| {
-            parse(&l.time)
-                .map(|t| {
-                    let s = (now - t).num_seconds();
-                    (0..5).contains(&s)
-                })
-                .unwrap_or(false)
-        })
-        .count() as u32
-        / 5;
-    let healthy_upstreams = store
-        .upstreams
-        .iter()
-        .filter(|u| matches!(u.status, UpstreamStatus::Healthy))
-        .count() as u32;
+    let window = WINDOW_HOURS * BUCKET_SECS;
+    let mut uniq: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let (mut pv_24h, mut recent5) = (0u64, 0u64);
+    for l in snap {
+        let Some(t) = parse(&l.time) else { continue };
+        let age = (now - t).num_seconds();
+        if (0..5).contains(&age) {
+            recent5 += 1;
+        }
+        if (0..window).contains(&age) {
+            pv_24h += 1;
+            uniq.insert(l.client_ip.as_str());
+        }
+    }
 
     DashboardSummary {
-        total_requests: logs.total(),
-        current_qps: qps,
-        // Real count of requests denied by the WAF engine.
-        waf_blocks: events.total_deny(),
-        active_connections: inflight.max(0) as u32,
-        tls_certificates: store.certs.len() as u32,
-        healthy_upstreams,
-        total_upstreams: store.upstreams.len() as u32,
+        total_requests: cfg.total_requests,
+        current_qps: (recent5 / 5) as u32,
+        waf_blocks: cfg.waf_blocks,
+        active_connections: cfg.inflight.max(0) as u32,
+        tls_certificates: cfg.tls_certificates,
+        healthy_upstreams: cfg.healthy_upstreams,
+        total_upstreams: cfg.total_upstreams,
+        pv_24h,
+        uv_24h: uniq.len() as u64,
     }
 }
 
-/// 24 one-minute buckets of real request counts (oldest first).
-pub fn traffic_points(logs: &LogBuffer) -> Vec<TrafficPoint> {
+/// 24 one-hour buckets of real request counts over the last 24 hours (oldest
+/// first) — matches the dashboard's "last 24 hours" chart.
+pub fn traffic_points(snap: &[AccessLog]) -> Vec<TrafficPoint> {
     let now = Utc::now();
-    let buckets = bucket_last_24m(logs.entries(), now, |l| l.time.as_str(), |_| true);
-    buckets
-        .iter()
-        .enumerate()
-        .map(|(idx, b)| TrafficPoint {
-            t: format!("-{}m", 23 - idx),
-            requests: b.len() as u64,
-            blocked: b
-                .iter()
-                .filter(|l| l.waf_action != WafAction::Allow)
-                .count() as u64,
+    let mut reqs = [0u64; 24];
+    let mut blocked = [0u64; 24];
+    for l in snap {
+        let Some(t) = parse(&l.time) else { continue };
+        let age = (now - t).num_seconds();
+        if !(0..WINDOW_HOURS * BUCKET_SECS).contains(&age) {
+            continue;
+        }
+        let idx = (23 - age / BUCKET_SECS) as usize;
+        reqs[idx] += 1;
+        if l.waf_action != WafAction::Allow {
+            blocked[idx] += 1;
+        }
+    }
+    (0..24)
+        .map(|i| TrafficPoint {
+            t: format!("-{}h", 23 - i),
+            requests: reqs[i],
+            blocked: blocked[i],
         })
         .collect()
 }
 
-pub fn top_routes(logs: &LogBuffer) -> Vec<TopRoute> {
+/// Hourly window length for the 24h analytics.
+const WINDOW_HOURS: i64 = 24;
+const BUCKET_SECS: i64 = 3600;
+
+/// Compute 24-hour analytics (PV / UV / hourly QPS / latency / error-rate /
+/// country breakdown) over `snap` for entries matching `keep`. Operates on an
+/// owned snapshot, so the caller can clone under the logs lock and release it
+/// before this runs — GeoIP lookups never hold the lock. Each distinct client IP
+/// is geo-resolved once (cached).
+pub fn window_stats(
+    snap: &[AccessLog],
+    now: DateTime<Utc>,
+    keep: impl Fn(&AccessLog) -> bool,
+    country_of: impl Fn(&str) -> Option<String>,
+    top_countries: usize,
+) -> RouteStats {
+    use std::collections::{HashMap, HashSet};
+    let window = WINDOW_HOURS * BUCKET_SECS;
+    let mut bucket_reqs = [0u64; 24];
+    let mut latencies: Vec<u32> = Vec::new();
+    let mut uniq: HashSet<&str> = HashSet::new();
+    let mut ip_country: HashMap<&str, String> = HashMap::new();
+    let mut country_counts: HashMap<String, u64> = HashMap::new();
+    let (mut pv, mut errors, mut recent60) = (0u64, 0u64, 0u64);
+
+    for l in snap {
+        if !keep(l) {
+            continue;
+        }
+        let Some(t) = parse(&l.time) else { continue };
+        let age = (now - t).num_seconds();
+        if !(0..window).contains(&age) {
+            continue;
+        }
+        pv += 1;
+        if age < 60 {
+            recent60 += 1;
+        }
+        uniq.insert(l.client_ip.as_str());
+        bucket_reqs[(23 - age / BUCKET_SECS) as usize] += 1;
+        latencies.push(l.latency_ms);
+        if l.status >= 400 {
+            errors += 1;
+        }
+        let cc = ip_country
+            .entry(l.client_ip.as_str())
+            .or_insert_with(|| country_of(&l.client_ip).unwrap_or_else(|| "??".into()));
+        *country_counts.entry(cc.clone()).or_default() += 1;
+    }
+
+    latencies.sort_unstable();
+    let pct = |p: f64| {
+        if latencies.is_empty() {
+            0.0
+        } else {
+            latencies[((latencies.len() - 1) as f64 * p).round() as usize] as f64
+        }
+    };
+    let qps_series = (0..24)
+        .map(|i| MetricPoint {
+            t: format!("-{}h", 23 - i),
+            value: round2(bucket_reqs[i] as f64 / BUCKET_SECS as f64),
+        })
+        .collect();
+    let mut countries: Vec<CountryStat> = country_counts
+        .into_iter()
+        .map(|(country, requests)| CountryStat { country, requests })
+        .collect();
+    countries.sort_by_key(|c| std::cmp::Reverse(c.requests));
+    countries.truncate(top_countries);
+
+    RouteStats {
+        window_hours: WINDOW_HOURS as u32,
+        pv,
+        uv: uniq.len() as u64,
+        current_qps: round2(recent60 as f64 / 60.0),
+        error_rate: if pv == 0 {
+            0.0
+        } else {
+            round2(errors as f64 / pv as f64 * 100.0)
+        },
+        latency_p50: pct(0.50),
+        latency_p99: pct(0.99),
+        qps_series,
+        countries,
+    }
+}
+
+pub fn top_routes(snap: &[AccessLog]) -> Vec<TopRoute> {
     use std::collections::HashMap;
     let mut counts: HashMap<String, u64> = HashMap::new();
-    for l in logs.entries() {
+    for l in snap {
         *counts.entry(format!("{}{}", l.host, l.path)).or_default() += 1;
     }
     let mut v: Vec<TopRoute> = counts
@@ -501,15 +601,15 @@ pub fn top_routes(logs: &LogBuffer) -> Vec<TopRoute> {
             blocked: 0,
         })
         .collect();
-    v.sort_by(|a, b| b.requests.cmp(&a.requests));
+    v.sort_by_key(|r| std::cmp::Reverse(r.requests));
     v.truncate(5);
     v
 }
 
 /// Real request throughput / latency / error-rate over the last 24 minutes.
-pub fn metrics_traffic(logs: &LogBuffer) -> Vec<MetricSeries> {
+pub fn metrics_traffic(snap: &[AccessLog]) -> Vec<MetricSeries> {
     let now = Utc::now();
-    let buckets = bucket_last_24m(logs.entries(), now, |l| l.time.as_str(), |_| true);
+    let buckets = bucket_last_24m(snap, now, |l| l.time.as_str(), |_| true);
     let labels = bucket_labels();
 
     let qps = series_from(labels, &buckets, |b| b.len() as f64 / 60.0);
@@ -588,39 +688,6 @@ pub fn metrics_waf(events: &EventBuffer) -> Vec<MetricSeries> {
     ]
 }
 
-/// Per-route throughput / latency / error-rate over the last 24 minutes, for the
-/// requests matching `host` (exact) and `path` (prefix) — powers the route
-/// drill-in analytics view.
-pub fn metrics_route(logs: &LogBuffer, host: &str, path: &str) -> Vec<MetricSeries> {
-    let now = Utc::now();
-    let buckets = bucket_last_24m(
-        logs.entries(),
-        now,
-        |l| l.time.as_str(),
-        |l| l.host.eq_ignore_ascii_case(host) && l.path.starts_with(path),
-    );
-    let labels = bucket_labels();
-
-    let qps = series_from(labels, &buckets, |b| b.len() as f64 / 60.0);
-    let p50 = series_from(labels, &buckets, |b| latency_pct(b, 0.50));
-    let p99 = series_from(labels, &buckets, |b| latency_pct(b, 0.99));
-    let err = series_from(labels, &buckets, |b| {
-        if b.is_empty() {
-            0.0
-        } else {
-            let bad = b.iter().filter(|l| l.status >= 400).count() as f64;
-            bad / b.len() as f64 * 100.0
-        }
-    });
-
-    vec![
-        named(qps, "qps", "Requests / sec", "req/s"),
-        named(p50, "latency_p50", "Latency p50", "ms"),
-        named(p99, "latency_p99", "Latency p99", "ms"),
-        named(err, "error_rate", "Error Rate", "%"),
-    ]
-}
-
 fn series_from(
     labels: &[String],
     buckets: &[Vec<&AccessLog>],
@@ -692,29 +759,41 @@ mod retention_tests {
     }
 
     #[test]
-    fn metrics_route_filters_by_host_and_path_prefix() {
-        let mut buf = LogBuffer::new(100, None);
+    fn window_stats_filters_and_counts_pv_uv() {
         let now = Utc::now();
-        buf.record(log_at(now, "a.com", "/api/x", 200)); // matches host + prefix
-        buf.record(log_at(now, "a.com", "/other", 200)); // wrong path
-        buf.record(log_at(now, "b.com", "/api/y", 200)); // wrong host
-
-        let series = metrics_route(&buf, "a.com", "/api");
-        let qps = series.iter().find(|s| s.key == "qps").unwrap();
-        // Exactly one matching request in the latest minute bucket → 1/60 req/s,
-        // rounded to 2 decimals by the series builder.
-        let last = qps.series.last().unwrap().value;
+        let snap = vec![
+            log_ip(now, "a.com", "/api/x", 200, "1.1.1.1"), // match
+            log_ip(now, "a.com", "/api/y", 200, "1.1.1.1"), // match (same IP)
+            log_ip(now, "a.com", "/api/z", 500, "2.2.2.2"), // match (error, new IP)
+            log_ip(now, "a.com", "/other", 200, "3.3.3.3"), // wrong path
+            log_ip(now, "b.com", "/api/q", 200, "4.4.4.4"), // wrong host
+        ];
+        let stats = window_stats(
+            &snap,
+            now,
+            |l| l.host.eq_ignore_ascii_case("a.com") && l.path.starts_with("/api"),
+            |_| None, // no GeoIP in test → all "??"
+            10,
+        );
+        assert_eq!(stats.pv, 3, "3 requests match host+path");
+        assert_eq!(stats.uv, 2, "2 distinct client IPs");
+        assert_eq!(stats.window_hours, 24);
+        assert!((stats.error_rate - round2(100.0 / 3.0)).abs() < 1e-6); // 1 of 3 is 5xx
         assert_eq!(
-            last,
-            round2(1.0 / 60.0),
-            "expected one matching request, got {last}"
+            stats.countries,
+            vec![CountryStat {
+                country: "??".into(),
+                requests: 3
+            }]
         );
-        // The wrong-host / wrong-path requests must not leak into the series.
-        let total: f64 = qps.series.iter().map(|p| p.value).sum();
-        assert!(
-            total > 0.0 && total < 0.05,
-            "only one matching request expected, total={total}"
-        );
+        // Newest hourly bucket holds the 3 just-recorded requests.
+        assert_eq!(stats.qps_series.last().unwrap().value, round2(3.0 / 3600.0));
+    }
+
+    fn log_ip(time: DateTime<Utc>, host: &str, path: &str, status: u16, ip: &str) -> AccessLog {
+        let mut l = log_at(time, host, path, status);
+        l.client_ip = ip.into();
+        l
     }
 }
 

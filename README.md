@@ -107,8 +107,10 @@ curl -H 'Host: app.example.com' http://127.0.0.1:8088/etc/passwd   # → 403
 
 The **WAF engine** (`crates/fluxgate-admin/src/waf.rs`) supports `ip` (exact +
 IPv4 CIDR), `path` / `method` / `header` (regex), and `rate_limit`
-(`prefix@Nr/s`, real per-client fixed window, bounded memory). `geo` needs a
-GeoIP database and never matches. Rules are **compiled once** (regexes/CIDRs
+(`prefix@Nr/s`, real per-client fixed window, bounded memory), and `geo`
+(country match via a MaxMind GeoIP `.mmdb` — `country in [KP, SY]` / `not in` /
+`==`; inert until a database is configured via `FLUXGATE_GEOIP_DB`). Rules are
+**compiled once** (regexes/CIDRs
 pre-built, priority-sorted) into a lock-free snapshot; path rules match the
 **path *and* query**, percent-decoded (so `%2e%2e` encoded traversal can't slip
 past). Rust's `regex` is linear-time, so attacker-supplied patterns can't ReDoS.
@@ -122,6 +124,13 @@ scanner User-Agents, and rate limits. An **OWASP CRS pack** (a curated subset of
 the OWASP Core Rule Set, Apache-2.0) can be imported on demand from the WAF page
 (or via `waf.rule.import`) for SQLi/XSS/RCE/LFI/RFI/PHP/Java/SSRF/scanner
 coverage — no new dependency, since it's reimplemented as regex rules.
+
+**Enable GeoIP** (`geo` rules) by dropping a MaxMind `.mmdb` in place:
+
+```bash
+mkdir -p fluxgate-geoip && curl -sL -o fluxgate-geoip/GeoLite2-Country.mmdb \
+  https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb
+```
 
 **Log retention:** access logs and WAF events older than
 `FLUXGATE_LOG_RETENTION_DAYS` (default **6**) are pruned from memory and disk on
@@ -206,6 +215,7 @@ the console falls back to the in-repo mock (`web/src/mock/`); force it with
 | `FLUXGATE_LOG_FILE` | `fluxgate-access.log` | Access-log JSONL file. Empty = disabled. |
 | `FLUXGATE_EVENT_FILE` | `fluxgate-events.log` | WAF-event JSONL file. Empty = disabled. |
 | `FLUXGATE_LOG_RETENTION_DAYS` | `6` | Days to keep access logs / WAF events (pruned hourly + on boot). |
+| `FLUXGATE_GEOIP_DB` | `fluxgate-geoip/GeoLite2-Country.mmdb` if present | MaxMind GeoIP `.mmdb` enabling `geo` WAF rules (empty = disabled). |
 | `RUST_LOG` | `info` | Tracing filter (e.g. `fluxgate_admin=debug`). |
 
 ---

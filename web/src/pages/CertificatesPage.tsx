@@ -32,7 +32,9 @@ function expiryLabel(cert: TlsCertificate, t: Translate): string {
 export function CertificatesPage() {
   const toast = useToast()
   const { t } = useI18n()
-  const { data, loading, error, refetch } = useRpc<TlsCertificate[]>('tls.cert.list')
+  // Poll so a Pending ACME cert flips to Valid automatically once the
+  // background HTTP-01 order completes (issuance takes ~10-60s).
+  const { data, loading, error, refetch } = useRpc<TlsCertificate[]>('tls.cert.list', {}, [], 5000)
 
   const [requestOpen, setRequestOpen] = useState(false)
   const [uploadOpen, setUploadOpen] = useState(false)

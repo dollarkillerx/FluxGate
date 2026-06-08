@@ -101,8 +101,16 @@ impl IpMatcher {
     }
 }
 
-/// A compiled matcher. `Never` covers GeoIP (no database shipped) and any rule
-/// whose pattern failed to compile — both simply never match.
+/// Compiled GeoIP matcher: `country in [..]` (or `not in` / `==` / `!=`).
+struct GeoMatcher {
+    /// Uppercase ISO-3166-1 alpha-2 country codes.
+    countries: Vec<String>,
+    /// True for `not in` / `!=` (match when the country is NOT listed).
+    negate: bool,
+}
+
+/// A compiled matcher. `Never` covers a rule whose pattern failed to compile —
+/// it simply never matches.
 enum Matcher {
     Ip(IpMatcher),
     Path(Regex),
@@ -116,7 +124,34 @@ enum Matcher {
         prefix: String,
         limit: u32,
     },
+    Geo(GeoMatcher),
     Never,
+}
+
+/// Parse a geo rule pattern like `country in [KP, SY]` / `country not in [US]` /
+/// `country == CN` into a `GeoMatcher`.
+fn parse_geo(pattern: &str) -> GeoMatcher {
+    let lower = pattern.to_lowercase();
+    let negate = lower.contains("not in") || pattern.contains("!=");
+    // Country codes are inside [...] for the list form, else after the operator.
+    let codes = if let (Some(a), Some(b)) = (pattern.find('['), pattern.rfind(']')) {
+        &pattern[a + 1..b]
+    } else if let Some(i) = pattern.rfind(['=', '>', '<']) {
+        &pattern[i + 1..]
+    } else {
+        ""
+    };
+    let countries = codes
+        .split(',')
+        .map(|s| {
+            s.chars()
+                .filter(char::is_ascii_alphabetic)
+                .collect::<String>()
+                .to_uppercase()
+        })
+        .filter(|s| s.len() == 2)
+        .collect();
+    GeoMatcher { countries, negate }
 }
 
 struct CompiledRule {
@@ -171,8 +206,8 @@ fn compile_rule(r: &WafRule) -> CompiledRule {
             }
             None => Matcher::Never,
         },
-        // GeoIP needs a location database we don't ship.
-        WafMatchType::Geo => Matcher::Never,
+        // Real GeoIP matching when a database is loaded (see WafEngine.geo).
+        WafMatchType::Geo => Matcher::Geo(parse_geo(&r.pattern)),
     };
     CompiledRule {
         id: r.id.clone(),
@@ -194,15 +229,26 @@ pub struct WafEngine {
     rate: Mutex<HashMap<String, (u64, u32)>>,
     /// Per-rule hit counters (rule_id → count) — kept off the shared config Store.
     hits: Mutex<HashMap<String, u64>>,
+    /// Optional GeoIP country database (MaxMind `.mmdb`). When absent, `geo`
+    /// rules never match.
+    geo: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
 impl WafEngine {
-    pub fn new() -> Self {
+    /// Create an engine, optionally with a loaded GeoIP database for `geo` rules.
+    pub fn new(geo: Option<maxminddb::Reader<Vec<u8>>>) -> Self {
         Self {
             compiled: RwLock::new(Arc::new(CompiledRuleSet::default())),
             rate: Mutex::new(HashMap::new()),
             hits: Mutex::new(HashMap::new()),
+            geo,
         }
+    }
+
+    /// Load a GeoIP country database from a `.mmdb` file (best effort).
+    pub fn load_geoip(path: &std::path::Path) -> Option<maxminddb::Reader<Vec<u8>>> {
+        let bytes = std::fs::read(path).ok()?;
+        maxminddb::Reader::from_source(bytes).ok()
     }
 
     /// (Re)compile the rule set: filter enabled, sort by ascending priority,
@@ -257,6 +303,7 @@ impl WafEngine {
             Matcher::RateLimit { id, prefix, limit } => {
                 self.rate_limited(id, prefix, *limit, ctx.client_ip, norm_path, now_sec)
             }
+            Matcher::Geo(gm) => self.geo_matches(gm, ctx.client_ip),
             Matcher::Never => false,
         }
     }
@@ -287,6 +334,27 @@ impl WafEngine {
         }
         entry.1 += 1;
         entry.1 > limit
+    }
+
+    /// Resolve a client IP's ISO-3166-1 alpha-2 country code via the GeoIP DB.
+    /// `None` if no DB is loaded, the IP is unparseable, or the country is
+    /// unknown (e.g. private / localhost addresses).
+    pub fn country_of(&self, client_ip: &str) -> Option<String> {
+        let reader = self.geo.as_ref()?;
+        let ip = client_ip.parse::<std::net::IpAddr>().ok()?;
+        reader
+            .lookup::<maxminddb::geoip2::Country>(ip)
+            .ok()
+            .and_then(|c| c.country.and_then(|x| x.iso_code.map(|s| s.to_uppercase())))
+    }
+
+    /// Test a geo rule against the client IP. No database / unknown country →
+    /// no match (so private / localhost addresses are never geo-blocked).
+    fn geo_matches(&self, gm: &GeoMatcher, client_ip: &str) -> bool {
+        match self.country_of(client_ip) {
+            Some(code) => gm.countries.contains(&code) ^ gm.negate,
+            None => false,
+        }
     }
 }
 
@@ -363,7 +431,7 @@ mod tests {
     }
 
     fn engine_with(rules: &[WafRule]) -> WafEngine {
-        let e = WafEngine::new();
+        let e = WafEngine::new(None);
         e.rebuild(rules);
         e
     }
@@ -462,7 +530,7 @@ mod tests {
         // benign case (every path matches the `/` prefix) and mask the true
         // full-traversal regex cost we want to measure.
         rules.retain(|r| !matches!(r.match_type, WafMatchType::RateLimit));
-        let engine = WafEngine::new();
+        let engine = WafEngine::new(None);
         engine.rebuild(&rules);
         let h = HashMap::new();
         let iters = 1_000_000u32;
@@ -533,6 +601,31 @@ mod tests {
         let d = engine.evaluate(WafAction::Allow, &ctx("1.1.1.1", "GET", "/x", &h), 0);
         assert_eq!(d.action, WafAction::Deny);
         assert_eq!(d.matched_rule_id.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn geo_pattern_parsing() {
+        let g = parse_geo("country in [KP, SY]");
+        assert_eq!(g.countries, vec!["KP", "SY"]);
+        assert!(!g.negate);
+        let g = parse_geo("country not in [US, CA]");
+        assert_eq!(g.countries, vec!["US", "CA"]);
+        assert!(g.negate);
+        let g = parse_geo("country == cn");
+        assert_eq!(g.countries, vec!["CN"]);
+        assert!(!g.negate);
+        let g = parse_geo("country != RU");
+        assert_eq!(g.countries, vec!["RU"]);
+        assert!(g.negate);
+    }
+
+    #[test]
+    fn geo_never_matches_without_database() {
+        // No DB loaded → geo rules are inert (never match).
+        let engine = engine_with(&[rule(WafMatchType::Geo, "country in [KP]", WafAction::Deny)]);
+        let h = HashMap::new();
+        let d = engine.evaluate(WafAction::Allow, &ctx("175.45.176.1", "GET", "/", &h), 0);
+        assert_eq!(d.action, WafAction::Allow);
     }
 
     #[test]

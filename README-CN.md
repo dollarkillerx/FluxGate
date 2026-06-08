@@ -94,7 +94,9 @@ curl -H 'Host: app.example.com' http://127.0.0.1:8088/etc/passwd   # → 403
 
 **WAF 引擎**(`crates/fluxgate-admin/src/waf.rs`)支持 `ip`(精确 + IPv4 CIDR)、
 `path` / `method` / `header`(正则)、`rate_limit`(`prefix@Nr/s`,真实的按客户端
-固定窗口、内存有界)。`geo` 需要 GeoIP 库,永不匹配。规则**一次性编译**(正则/CIDR
+固定窗口、内存有界)、以及 `geo`(用 MaxMind GeoIP `.mmdb` 按国家匹配——
+`country in [KP, SY]` / `not in` / `==`;配置 `FLUXGATE_GEOIP_DB` 后才生效)。规则
+**一次性编译**(正则/CIDR
 预构建、按优先级排序)成无锁快照;path 规则检查 **path + query** 且**百分号解码**
 (`%2e%2e` 编码穿越也拦得住)。Rust `regex` 线性时间,攻击者提交的正则不会 ReDoS。
 首个命中生效,否则回落默认动作。**数据面强制执行**;管理台永不被求值(不会把自己
@@ -105,6 +107,13 @@ curl -H 'Host: app.example.com' http://127.0.0.1:8088/etc/passwd   # → 403
 导入 **OWASP CRS 规则包**(OWASP Core Rule Set 的精选子集,Apache-2.0,或用
 `waf.rule.import`),补充 SQLi/XSS/RCE/LFI/RFI/PHP/Java/SSRF/扫描器 等覆盖——零新
 依赖(改写成正则规则)。
+
+**启用 GeoIP**(`geo` 规则)只需放一个 MaxMind `.mmdb`:
+
+```bash
+mkdir -p fluxgate-geoip && curl -sL -o fluxgate-geoip/GeoLite2-Country.mmdb \
+  https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb
+```
 
 **日志保留:** 超过 `FLUXGATE_LOG_RETENTION_DAYS`(默认 **6** 天)的访问日志和 WAF
 事件,会在启动时和每小时从内存与磁盘清理。
@@ -186,6 +195,7 @@ mock(`web/src/mock/`);用 `VITE_USE_MOCK=true` 强制启用。
 | `FLUXGATE_LOG_FILE` | `fluxgate-access.log` | 访问日志 JSONL 文件。留空 = 关闭。 |
 | `FLUXGATE_EVENT_FILE` | `fluxgate-events.log` | WAF 事件 JSONL 文件。留空 = 关闭。 |
 | `FLUXGATE_LOG_RETENTION_DAYS` | `6` | 访问日志 / WAF 事件保留天数(每小时 + 启动时清理)。 |
+| `FLUXGATE_GEOIP_DB` | 存在则用 `fluxgate-geoip/GeoLite2-Country.mmdb` | MaxMind GeoIP `.mmdb`,启用 `geo` 规则(留空 = 关闭)。 |
 | `RUST_LOG` | `info` | 日志过滤(如 `fluxgate_admin=debug`)。 |
 
 ---
