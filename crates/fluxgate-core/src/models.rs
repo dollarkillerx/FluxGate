@@ -28,9 +28,22 @@ pub struct Site {
     pub https_redirect: bool,
     /// Default WAF setting applied to new path routes under this site.
     pub waf_enabled: bool,
+    /// Maximum request body (upload) size in **MB**; `0` = unlimited. Default 500.
+    #[serde(default = "default_max_body_mb")]
+    pub max_body_mb: u64,
+    /// Upstream response timeout in **seconds**; `0` falls back to the default. Default 120.
+    #[serde(default = "default_upstream_timeout_secs")]
+    pub upstream_timeout_secs: u64,
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+fn default_max_body_mb() -> u64 {
+    500
+}
+fn default_upstream_timeout_secs() -> u64 {
+    120
 }
 
 /// A **route** maps a path (under its parent `Site`'s host) to an upstream.

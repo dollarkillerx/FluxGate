@@ -488,6 +488,7 @@ dependencies = [
  "axum",
  "chrono",
  "fluxgate-core",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "instant-acme",

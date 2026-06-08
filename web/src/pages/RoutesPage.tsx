@@ -28,9 +28,11 @@ interface SiteForm {
   cert_id: string
   https_redirect: boolean
   waf_enabled: boolean
+  max_body_mb: number
+  upstream_timeout_secs: number
   enabled: boolean
 }
-const emptySite: SiteForm = { name: '', host: '', tls_enabled: true, cert_id: '', https_redirect: true, waf_enabled: true, enabled: true }
+const emptySite: SiteForm = { name: '', host: '', tls_enabled: true, cert_id: '', https_redirect: true, waf_enabled: true, max_body_mb: 500, upstream_timeout_secs: 120, enabled: true }
 
 /** A certificate covers `host` if its domain matches exactly (case-insensitive)
  *  or via a single-label wildcard (`*.example.com` ⊇ `a.example.com`). */
@@ -71,6 +73,7 @@ export function RoutesPage() {
   const [siteToDelete, setSiteToDelete] = useState<Site | null>(null)
   const [routeToDelete, setRouteToDelete] = useState<Route | null>(null)
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
+  const [advanced, setAdvanced] = useState(false)
   const toggleExpand = (id: string) => setExpanded((e) => ({ ...e, [id]: !e[id] }))
 
   const routesBySite = useMemo(() => {
@@ -187,7 +190,7 @@ export function RoutesPage() {
       <PageHeader
         title={t('sites.title')}
         description={t('sites.desc')}
-        actions={<Button icon={<Plus size={16} />} onClick={() => setSiteForm({ ...emptySite })}>{t('sites.new')}</Button>}
+        actions={<Button icon={<Plus size={16} />} onClick={() => { setAdvanced(false); setSiteForm({ ...emptySite }) }}>{t('sites.new')}</Button>}
       />
 
       <StateView loading={sites.loading} error={sites.error} data={sites.data} onRetry={reload}>
@@ -226,7 +229,7 @@ export function RoutesPage() {
                         <Button variant="ghost" size="sm" icon={<Plus size={14} />} onClick={() => { setExpanded((e) => ({ ...e, [site.id]: true })); setRouteForm({ site_id: site.id, path: '/', upstream: upstreams.data?.[0]?.name ?? '', waf_enabled: site.waf_enabled, enabled: true }) }}>
                           {t('sites.addPath')}
                         </Button>
-                        <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => setSiteForm({ id: site.id, name: site.name, host: site.host, tls_enabled: site.tls_enabled, cert_id: site.cert_id ?? '', https_redirect: site.https_redirect ?? false, waf_enabled: site.waf_enabled, enabled: site.enabled })} aria-label={t('common.edit')} />
+                        <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => { setAdvanced(false); setSiteForm({ id: site.id, name: site.name, host: site.host, tls_enabled: site.tls_enabled, cert_id: site.cert_id ?? '', https_redirect: site.https_redirect ?? false, waf_enabled: site.waf_enabled, max_body_mb: site.max_body_mb ?? 500, upstream_timeout_secs: site.upstream_timeout_secs ?? 120, enabled: site.enabled }) }} aria-label={t('common.edit')} />
                         <Button variant="ghost" size="sm" icon={<Trash2 size={14} className="text-red-500" />} onClick={() => setSiteToDelete(site)} aria-label={t('common.delete')} />
                       </div>
                     </div>
@@ -324,6 +327,39 @@ export function RoutesPage() {
                 </label>
               </>
             )}
+
+            {/* Advanced options (collapsible) */}
+            <div className="border-t border-slate-200 pt-3 dark:border-slate-700">
+              <button
+                type="button"
+                onClick={() => setAdvanced((v) => !v)}
+                className="flex items-center gap-1.5 text-sm font-medium text-slate-600 hover:text-brand-600 dark:text-slate-300"
+                aria-expanded={advanced}
+              >
+                <ChevronRight size={15} className={`transition-transform ${advanced ? 'rotate-90' : ''}`} />
+                {t('sites.advanced')}
+              </button>
+              {advanced && (
+                <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <Field label={t('sites.maxBody')} hint={t('sites.maxBodyHint')}>
+                    <Input
+                      type="number"
+                      min={0}
+                      value={siteForm.max_body_mb}
+                      onChange={(e) => setSiteForm({ ...siteForm, max_body_mb: Math.max(0, Number(e.target.value) || 0) })}
+                    />
+                  </Field>
+                  <Field label={t('sites.upstreamTimeout')} hint={t('sites.upstreamTimeoutHint')}>
+                    <Input
+                      type="number"
+                      min={1}
+                      value={siteForm.upstream_timeout_secs}
+                      onChange={(e) => setSiteForm({ ...siteForm, upstream_timeout_secs: Math.max(1, Number(e.target.value) || 1) })}
+                    />
+                  </Field>
+                </div>
+              )}
+            </div>
           </div>
         )}
       </Modal>

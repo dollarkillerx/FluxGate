@@ -163,7 +163,7 @@ async fn proxy_handler(
     }
 
     // --- Routing + load balancing (single store lock, also decides redirect) -
-    let (upstream_name, address, waf_enabled, default_waf) =
+    let (upstream_name, address, waf_enabled, default_waf, max_body_mb, upstream_timeout_secs) =
         match pick_target(&state, &host, &path, &client_ip, secure) {
             // Plaintext request for a TLS-enabled site with redirect on → 308 to https.
             RouteOutcome::Redirect => {
@@ -191,7 +191,16 @@ async fn proxy_handler(
                 address,
                 waf_enabled,
                 default_waf,
-            } => (upstream, address, waf_enabled, default_waf),
+                max_body_mb,
+                upstream_timeout_secs,
+            } => (
+                upstream,
+                address,
+                waf_enabled,
+                default_waf,
+                max_body_mb,
+                upstream_timeout_secs,
+            ),
             RouteOutcome::NoRoute => {
                 log_request(
                     &state,
@@ -289,6 +298,30 @@ async fn proxy_handler(
         }
     }
 
+    // --- Per-site upload size cap (max_body_mb; 0 = unlimited) ---------------
+    // Reject oversized uploads up front via Content-Length (the common case for
+    // file uploads), with a clean 413. Chunked/unknown-length bodies are bounded
+    // by the streaming wrapper below instead.
+    let max_body_bytes = max_body_mb.saturating_mul(1024 * 1024);
+    if max_body_bytes > 0 {
+        if let Some(len) = content_length(&headers) {
+            if len > max_body_bytes {
+                log_request(
+                    &state,
+                    &client_ip,
+                    &method,
+                    &host,
+                    &path,
+                    413,
+                    started,
+                    &upstream_name,
+                    WafAction::Allow,
+                );
+                return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response();
+            }
+        }
+    }
+
     let is_ws = is_websocket(&headers);
     // Capture the client-side upgrade future before consuming the request.
     let client_upgrade = if is_ws {
@@ -309,31 +342,52 @@ async fn proxy_handler(
     if let Ok(v) = client_ip.parse::<axum::http::HeaderValue>() {
         builder = builder.header(HeaderName::from_static("x-forwarded-for"), v);
     }
-    // WS handshake carries no body; everything else streams through.
-    let upstream_body = if is_ws { Body::empty() } else { body };
+    // WS handshake carries no body; everything else streams through. When a size
+    // cap is set, wrap the stream so an oversized chunked upload is aborted
+    // (rather than buffered) instead of slipping past the Content-Length check.
+    let upstream_body = if is_ws {
+        Body::empty()
+    } else if max_body_bytes > 0 {
+        Body::new(http_body_util::Limited::new(body, max_body_bytes as usize))
+    } else {
+        body
+    };
     let upstream_req = match builder.body(upstream_body) {
         Ok(r) => r,
         Err(_) => return (StatusCode::BAD_GATEWAY, "Bad upstream request").into_response(),
     };
 
     // --- Send ----------------------------------------------------------------
+    // Per-site upstream timeout (0 → fall back to the default).
+    let timeout = Duration::from_secs(if upstream_timeout_secs == 0 {
+        UPSTREAM_TIMEOUT.as_secs()
+    } else {
+        upstream_timeout_secs
+    });
     let send = state.proxy_client.request(upstream_req);
-    let mut resp = match tokio::time::timeout(UPSTREAM_TIMEOUT, send).await {
+    let mut resp = match tokio::time::timeout(timeout, send).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            tracing::warn!(upstream = %upstream_name, %url, "upstream request failed: {e}");
+            // A streamed upload that blew past the per-site cap surfaces as a body
+            // error here — report it as 413 (client error), not a 502.
+            let (status, msg) = if is_length_limit(&e) {
+                (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large")
+            } else {
+                tracing::warn!(upstream = %upstream_name, %url, "upstream request failed: {e}");
+                (StatusCode::BAD_GATEWAY, "Upstream request failed")
+            };
             log_request(
                 &state,
                 &client_ip,
                 &method,
                 &host,
                 &path,
-                502,
+                status.as_u16(),
                 started,
                 &upstream_name,
                 WafAction::Allow,
             );
-            return (StatusCode::BAD_GATEWAY, "Upstream request failed").into_response();
+            return (status, msg).into_response();
         }
         Err(_) => {
             log_request(
@@ -450,6 +504,9 @@ enum RouteOutcome {
         /// Default WAF action, read under the same lock so the hot path doesn't
         /// re-lock the store just to fetch it.
         default_waf: WafAction,
+        /// Site upload cap in MB (`0` = unlimited) and upstream timeout in secs.
+        max_body_mb: u64,
+        upstream_timeout_secs: u64,
     },
     NoRoute,
     NoHealthyUpstream,
@@ -486,6 +543,8 @@ fn pick_target(
     };
     let waf_enabled = route.waf_enabled;
     let default_waf = store.settings.default_waf_action;
+    let max_body_mb = site.max_body_mb;
+    let upstream_timeout_secs = site.upstream_timeout_secs;
     let mut cursor = state.lb_cursor.lock();
     match select_node(upstream, client_ip, &mut cursor) {
         Some(address) => RouteOutcome::Found {
@@ -493,6 +552,8 @@ fn pick_target(
             address,
             waf_enabled,
             default_waf,
+            max_body_mb,
+            upstream_timeout_secs,
         },
         None => RouteOutcome::NoHealthyUpstream,
     }
@@ -552,6 +613,27 @@ fn header_str(headers: &HeaderMap, name: &str) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string()
+}
+
+/// Parse the `Content-Length` request header, if present and valid.
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+/// Whether an error chain contains a `Limited` body length-limit error — i.e. a
+/// streamed upload exceeded the per-site cap (vs. a genuine upstream failure).
+fn is_length_limit(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = source {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = e.source();
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]

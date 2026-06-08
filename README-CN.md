@@ -33,3 +33,6 @@ curl https://raw.githubusercontent.com/dollarkillerx/FluxGate/refs/heads/main/in
 
 > 控制台为自签 HTTPS 证书,浏览器首次访问需手动信任。ACME 自动签发需要域名解析到
 > 本机且 80 端口公网可达。
+>
+> 每个站点默认 **500 MB 上传上限** 和 **120 秒上游超时** —— 可在
+> **编辑网站 → 高级选项** 里调整(上限设为 0 表示不限)。

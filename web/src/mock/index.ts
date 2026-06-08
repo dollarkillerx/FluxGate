@@ -269,6 +269,7 @@ const handlers: Record<string, (p: Params) => unknown> = {
       id: sid('st'), name: p.name || p.host || '', host: p.host ?? '',
       tls_enabled: p.tls_enabled ?? true, cert_id: p.cert_id || null,
       https_redirect: p.https_redirect ?? true, waf_enabled: p.waf_enabled ?? true,
+      max_body_mb: p.max_body_mb ?? 500, upstream_timeout_secs: p.upstream_timeout_secs ?? 120,
       enabled: p.enabled ?? true, created_at: now(), updated_at: now(),
     }
     sites.unshift(site)
@@ -276,7 +277,7 @@ const handlers: Record<string, (p: Params) => unknown> = {
   },
   'site.update': (p) => {
     const site = find(sites, p.id, 'site')
-    Object.assign(site, pick(p, ['name', 'host', 'tls_enabled', 'cert_id', 'https_redirect', 'waf_enabled', 'enabled']))
+    Object.assign(site, pick(p, ['name', 'host', 'tls_enabled', 'cert_id', 'https_redirect', 'waf_enabled', 'max_body_mb', 'upstream_timeout_secs', 'enabled']))
     site.updated_at = now()
     return site
   },

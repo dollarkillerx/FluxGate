@@ -304,6 +304,8 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 cert_id: input.cert_id.filter(|s| !s.is_empty()),
                 https_redirect: input.https_redirect.unwrap_or(true),
                 waf_enabled: input.waf_enabled.unwrap_or(true),
+                max_body_mb: input.max_body_mb.unwrap_or(500),
+                upstream_timeout_secs: input.upstream_timeout_secs.unwrap_or(120),
                 enabled: input.enabled.unwrap_or(true),
                 created_at: now.clone(),
                 updated_at: now,
@@ -337,6 +339,12 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             }
             if let Some(v) = input.waf_enabled {
                 s.waf_enabled = v;
+            }
+            if let Some(v) = input.max_body_mb {
+                s.max_body_mb = v;
+            }
+            if let Some(v) = input.upstream_timeout_secs {
+                s.upstream_timeout_secs = v;
             }
             if let Some(v) = input.enabled {
                 s.enabled = v;
@@ -1156,6 +1164,8 @@ struct SiteInput {
     cert_id: Option<String>,
     https_redirect: Option<bool>,
     waf_enabled: Option<bool>,
+    max_body_mb: Option<u64>,
+    upstream_timeout_secs: Option<u64>,
     enabled: Option<bool>,
 }
 

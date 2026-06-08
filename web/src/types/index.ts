@@ -15,6 +15,10 @@ export interface Site {
   https_redirect?: boolean
   /** Default WAF setting applied to new paths under this site. */
   waf_enabled: boolean
+  /** Max request body (upload) size in MB; 0 = unlimited. */
+  max_body_mb?: number
+  /** Upstream response timeout in seconds. */
+  upstream_timeout_secs?: number
   enabled: boolean
   created_at: string
   updated_at: string

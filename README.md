@@ -36,3 +36,7 @@ Re-run the same command later to get a **stop / restart / update** menu
 > The console uses a self-signed HTTPS certificate — accept the browser warning
 > on first visit. ACME issuance needs your domain to resolve to the host and
 > port 80 reachable from the internet.
+>
+> Each site defaults to a **500 MB upload cap** and a **120 s upstream timeout**
+> — change them in **Edit Site → Advanced options** (set the cap to 0 for
+> unlimited).
