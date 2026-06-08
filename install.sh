@@ -253,6 +253,7 @@ select_language(){
   else
     LC="$detected"
   fi
+  return 0   # never let a trailing test's exit code abort the script (set -e)
 }
 
 # ---------------------------------------------------------------------------
