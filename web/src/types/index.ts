@@ -19,6 +19,10 @@ export interface Site {
   max_body_mb?: number
   /** Upstream response timeout in seconds. */
   upstream_timeout_secs?: number
+  /** Block known crawler/bot User-Agents with 403. */
+  block_crawler_ua?: boolean
+  /** Serve a disallow-all robots.txt instead of proxying it. */
+  rewrite_robots?: boolean
   enabled: boolean
   created_at: string
   updated_at: string

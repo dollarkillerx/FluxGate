@@ -34,6 +34,12 @@ pub struct Site {
     /// Upstream response timeout in **seconds**; `0` falls back to the default. Default 120.
     #[serde(default = "default_upstream_timeout_secs")]
     pub upstream_timeout_secs: u64,
+    /// Block known crawler / bot User-Agents with 403.
+    #[serde(default)]
+    pub block_crawler_ua: bool,
+    /// Serve a disallow-all `robots.txt` instead of proxying it to the origin.
+    #[serde(default)]
+    pub rewrite_robots: bool,
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,

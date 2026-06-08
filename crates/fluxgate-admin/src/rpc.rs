@@ -306,6 +306,8 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 waf_enabled: input.waf_enabled.unwrap_or(true),
                 max_body_mb: input.max_body_mb.unwrap_or(500),
                 upstream_timeout_secs: input.upstream_timeout_secs.unwrap_or(120),
+                block_crawler_ua: input.block_crawler_ua.unwrap_or(false),
+                rewrite_robots: input.rewrite_robots.unwrap_or(false),
                 enabled: input.enabled.unwrap_or(true),
                 created_at: now.clone(),
                 updated_at: now,
@@ -345,6 +347,12 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             }
             if let Some(v) = input.upstream_timeout_secs {
                 s.upstream_timeout_secs = v;
+            }
+            if let Some(v) = input.block_crawler_ua {
+                s.block_crawler_ua = v;
+            }
+            if let Some(v) = input.rewrite_robots {
+                s.rewrite_robots = v;
             }
             if let Some(v) = input.enabled {
                 s.enabled = v;
@@ -1166,6 +1174,8 @@ struct SiteInput {
     waf_enabled: Option<bool>,
     max_body_mb: Option<u64>,
     upstream_timeout_secs: Option<u64>,
+    block_crawler_ua: Option<bool>,
+    rewrite_robots: Option<bool>,
     enabled: Option<bool>,
 }
 

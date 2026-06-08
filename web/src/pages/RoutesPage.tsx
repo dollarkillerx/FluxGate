@@ -30,9 +30,11 @@ interface SiteForm {
   waf_enabled: boolean
   max_body_mb: number
   upstream_timeout_secs: number
+  block_crawler_ua: boolean
+  rewrite_robots: boolean
   enabled: boolean
 }
-const emptySite: SiteForm = { name: '', host: '', tls_enabled: true, cert_id: '', https_redirect: true, waf_enabled: true, max_body_mb: 500, upstream_timeout_secs: 120, enabled: true }
+const emptySite: SiteForm = { name: '', host: '', tls_enabled: true, cert_id: '', https_redirect: true, waf_enabled: true, max_body_mb: 500, upstream_timeout_secs: 120, block_crawler_ua: false, rewrite_robots: false, enabled: true }
 
 /** A certificate covers `host` if its domain matches exactly (case-insensitive)
  *  or via a single-label wildcard (`*.example.com` ⊇ `a.example.com`). */
@@ -229,7 +231,7 @@ export function RoutesPage() {
                         <Button variant="ghost" size="sm" icon={<Plus size={14} />} onClick={() => { setExpanded((e) => ({ ...e, [site.id]: true })); setRouteForm({ site_id: site.id, path: '/', upstream: upstreams.data?.[0]?.name ?? '', waf_enabled: site.waf_enabled, enabled: true }) }}>
                           {t('sites.addPath')}
                         </Button>
-                        <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => { setAdvanced(false); setSiteForm({ id: site.id, name: site.name, host: site.host, tls_enabled: site.tls_enabled, cert_id: site.cert_id ?? '', https_redirect: site.https_redirect ?? false, waf_enabled: site.waf_enabled, max_body_mb: site.max_body_mb ?? 500, upstream_timeout_secs: site.upstream_timeout_secs ?? 120, enabled: site.enabled }) }} aria-label={t('common.edit')} />
+                        <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => { setAdvanced(false); setSiteForm({ id: site.id, name: site.name, host: site.host, tls_enabled: site.tls_enabled, cert_id: site.cert_id ?? '', https_redirect: site.https_redirect ?? false, waf_enabled: site.waf_enabled, max_body_mb: site.max_body_mb ?? 500, upstream_timeout_secs: site.upstream_timeout_secs ?? 120, block_crawler_ua: site.block_crawler_ua ?? false, rewrite_robots: site.rewrite_robots ?? false, enabled: site.enabled }) }} aria-label={t('common.edit')} />
                         <Button variant="ghost" size="sm" icon={<Trash2 size={14} className="text-red-500" />} onClick={() => setSiteToDelete(site)} aria-label={t('common.delete')} />
                       </div>
                     </div>
@@ -357,6 +359,18 @@ export function RoutesPage() {
                       onChange={(e) => setSiteForm({ ...siteForm, upstream_timeout_secs: Math.max(1, Number(e.target.value) || 1) })}
                     />
                   </Field>
+                  <div className="sm:col-span-2">
+                    <label className="flex items-start gap-2.5 text-sm text-slate-700 dark:text-slate-200">
+                      <Toggle checked={siteForm.block_crawler_ua} onChange={(v) => setSiteForm({ ...siteForm, block_crawler_ua: v })} aria-label="Block crawlers" />
+                      <span>{t('sites.blockCrawlers')}<span className="ml-1 block text-xs text-slate-400">{t('sites.blockCrawlersHint')}</span></span>
+                    </label>
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className="flex items-start gap-2.5 text-sm text-slate-700 dark:text-slate-200">
+                      <Toggle checked={siteForm.rewrite_robots} onChange={(v) => setSiteForm({ ...siteForm, rewrite_robots: v })} aria-label="Rewrite robots.txt" />
+                      <span>{t('sites.rewriteRobots')}<span className="ml-1 block text-xs text-slate-400">{t('sites.rewriteRobotsHint')}</span></span>
+                    </label>
+                  </div>
                 </div>
               )}
             </div>

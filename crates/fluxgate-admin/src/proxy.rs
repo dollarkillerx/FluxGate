@@ -163,73 +163,107 @@ async fn proxy_handler(
     }
 
     // --- Routing + load balancing (single store lock, also decides redirect) -
-    let (upstream_name, address, waf_enabled, default_waf, max_body_mb, upstream_timeout_secs) =
-        match pick_target(&state, &host, &path, &client_ip, secure) {
-            // Plaintext request for a TLS-enabled site with redirect on → 308 to https.
-            RouteOutcome::Redirect => {
-                let location = format!("https://{host}{path_and_query}");
-                log_request(
-                    &state,
-                    &client_ip,
-                    &method,
-                    &host,
-                    &path,
-                    StatusCode::PERMANENT_REDIRECT.as_u16(),
-                    started,
-                    "-",
-                    WafAction::Allow,
-                );
-                return Response::builder()
-                    .status(StatusCode::PERMANENT_REDIRECT)
-                    .header(axum::http::header::LOCATION, location)
-                    .body(Body::empty())
-                    .map(IntoResponse::into_response)
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
-            }
-            RouteOutcome::Found {
-                upstream,
-                address,
-                waf_enabled,
-                default_waf,
-                max_body_mb,
-                upstream_timeout_secs,
-            } => (
-                upstream,
-                address,
-                waf_enabled,
-                default_waf,
-                max_body_mb,
-                upstream_timeout_secs,
-            ),
-            RouteOutcome::NoRoute => {
-                log_request(
-                    &state,
-                    &client_ip,
-                    &method,
-                    &host,
-                    &path,
-                    404,
-                    started,
-                    "-",
-                    WafAction::Allow,
-                );
-                return (StatusCode::NOT_FOUND, "No matching route").into_response();
-            }
-            RouteOutcome::NoHealthyUpstream => {
-                log_request(
-                    &state,
-                    &client_ip,
-                    &method,
-                    &host,
-                    &path,
-                    502,
-                    started,
-                    "-",
-                    WafAction::Allow,
-                );
-                return (StatusCode::BAD_GATEWAY, "No healthy upstream").into_response();
-            }
-        };
+    let target = match pick_target(&state, &host, &path, &client_ip, secure) {
+        // Plaintext request for a TLS-enabled site with redirect on → 308 to https.
+        RouteOutcome::Redirect => {
+            let location = format!("https://{host}{path_and_query}");
+            log_request(
+                &state,
+                &client_ip,
+                &method,
+                &host,
+                &path,
+                StatusCode::PERMANENT_REDIRECT.as_u16(),
+                started,
+                "-",
+                WafAction::Allow,
+            );
+            return Response::builder()
+                .status(StatusCode::PERMANENT_REDIRECT)
+                .header(axum::http::header::LOCATION, location)
+                .body(Body::empty())
+                .map(IntoResponse::into_response)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+        RouteOutcome::Found(t) => t,
+        RouteOutcome::NoRoute => {
+            log_request(
+                &state,
+                &client_ip,
+                &method,
+                &host,
+                &path,
+                404,
+                started,
+                "-",
+                WafAction::Allow,
+            );
+            return (StatusCode::NOT_FOUND, "No matching route").into_response();
+        }
+        RouteOutcome::NoHealthyUpstream => {
+            log_request(
+                &state,
+                &client_ip,
+                &method,
+                &host,
+                &path,
+                502,
+                started,
+                "-",
+                WafAction::Allow,
+            );
+            return (StatusCode::BAD_GATEWAY, "No healthy upstream").into_response();
+        }
+    };
+    // Bind the fields as locals so the rest of the handler reads naturally;
+    // adding a site setting now only touches `Target` + `pick_target`.
+    let Target {
+        upstream: upstream_name,
+        address,
+        waf_enabled,
+        default_waf,
+        max_body_mb,
+        upstream_timeout_secs,
+        block_crawler_ua,
+        rewrite_robots,
+    } = target;
+
+    // --- Crawler controls (site Advanced options) ---------------------------
+    // Serve a disallow-all robots.txt instead of proxying it to the origin.
+    if rewrite_robots && path == "/robots.txt" {
+        log_request(
+            &state,
+            &client_ip,
+            &method,
+            &host,
+            &path,
+            200,
+            started,
+            "-",
+            WafAction::Allow,
+        );
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "User-agent: *\nDisallow: /\n",
+        )
+            .into_response();
+    }
+    // Block known crawler / bot User-Agents with 403.
+    if block_crawler_ua && is_crawler_ua(&headers) {
+        log_request(
+            &state,
+            &client_ip,
+            &method,
+            &host,
+            &path,
+            403,
+            started,
+            "-",
+            WafAction::Deny,
+        );
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
 
     // --- WAF enforcement (only when the matched path has WAF enabled) --------
     if waf_enabled {
@@ -497,19 +531,26 @@ fn forward_request_header(name: &HeaderName, is_ws: bool) -> bool {
 enum RouteOutcome {
     /// Plaintext request to a TLS-enabled site with HTTP→HTTPS redirect on.
     Redirect,
-    Found {
-        upstream: String,
-        address: String,
-        waf_enabled: bool,
-        /// Default WAF action, read under the same lock so the hot path doesn't
-        /// re-lock the store just to fetch it.
-        default_waf: WafAction,
-        /// Site upload cap in MB (`0` = unlimited) and upstream timeout in secs.
-        max_body_mb: u64,
-        upstream_timeout_secs: u64,
-    },
+    Found(Target),
     NoRoute,
     NoHealthyUpstream,
+}
+
+/// Everything `pick_target` resolves for a forwardable request — the upstream
+/// node plus the site/route settings the handler needs. Read under one store
+/// lock so the hot path doesn't re-lock. Add new site settings here (and in
+/// `pick_target`) — the handler binds them by name.
+struct Target {
+    upstream: String,
+    address: String,
+    waf_enabled: bool,
+    default_waf: WafAction,
+    /// Site upload cap in MB (`0` = unlimited) and upstream timeout in secs.
+    max_body_mb: u64,
+    upstream_timeout_secs: u64,
+    /// Site crawler controls (Advanced options).
+    block_crawler_ua: bool,
+    rewrite_robots: bool,
 }
 
 /// Resolve `host` → enabled site → longest-prefix enabled path route, then a
@@ -545,16 +586,20 @@ fn pick_target(
     let default_waf = store.settings.default_waf_action;
     let max_body_mb = site.max_body_mb;
     let upstream_timeout_secs = site.upstream_timeout_secs;
+    let block_crawler_ua = site.block_crawler_ua;
+    let rewrite_robots = site.rewrite_robots;
     let mut cursor = state.lb_cursor.lock();
     match select_node(upstream, client_ip, &mut cursor) {
-        Some(address) => RouteOutcome::Found {
+        Some(address) => RouteOutcome::Found(Target {
             upstream: upstream.name.clone(),
             address,
             waf_enabled,
             default_waf,
             max_body_mb,
             upstream_timeout_secs,
-        },
+            block_crawler_ua,
+            rewrite_robots,
+        }),
         None => RouteOutcome::NoHealthyUpstream,
     }
 }
@@ -613,6 +658,49 @@ fn header_str(headers: &HeaderMap, name: &str) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string()
+}
+
+/// Lowercased substrings identifying crawler / scraper User-Agents. Covers
+/// search-engine bots, SEO/scraper services, AI crawlers and headless tooling.
+/// Generic HTTP clients (curl/wget/etc.) are intentionally excluded to avoid
+/// blocking legitimate automation and health checks.
+const CRAWLER_UA_MARKERS: &[&str] = &[
+    "bot",
+    "spider",
+    "crawler",
+    "crawl",
+    "slurp",
+    "mediapartners",
+    "facebookexternalhit",
+    "ahrefs",
+    "semrush",
+    "mj12",
+    "dotbot",
+    "petalbot",
+    "bytespider",
+    "yandex",
+    "baiduspider",
+    "sogou",
+    "gptbot",
+    "ccbot",
+    "claudebot",
+    "anthropic",
+    "google-extended",
+    "perplexitybot",
+    "amazonbot",
+    "scrapy",
+    "headlesschrome",
+    "phantomjs",
+];
+
+/// Whether the request's `User-Agent` looks like a crawler/bot.
+fn is_crawler_ua(headers: &HeaderMap) -> bool {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    !ua.is_empty() && CRAWLER_UA_MARKERS.iter().any(|m| ua.contains(m))
 }
 
 /// Parse the `Content-Length` request header, if present and valid.
