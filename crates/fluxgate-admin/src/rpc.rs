@@ -274,7 +274,7 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 let g = state.logs.lock();
                 (g.snapshot(), g.total())
             };
-            ok(collector::dashboard_summary(
+            let mut summary = collector::dashboard_summary(
                 &snap,
                 Utc::now(),
                 collector::SummaryConfig {
@@ -285,7 +285,10 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                     total_requests,
                     inflight,
                 },
-            ))
+            );
+            // Whole-proxy byte traffic (summed across all sites).
+            summary.traffic = state.traffic.global_totals();
+            ok(summary)
         }
         "dashboard.traffic" => {
             // No store needed — release it before scanning logs.
@@ -316,6 +319,20 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 limit,
             );
             ok(stats.countries)
+        }
+        "dashboard.devices" => {
+            // Whole-proxy client device / OS breakdown over the last 24h, parsed
+            // from User-Agents recorded in the access log.
+            drop(store);
+            let snap = state.logs.lock().snapshot();
+            let stats = collector::window_stats(
+                &snap,
+                Utc::now(),
+                |_| true,
+                |ip| state.waf.country_of(ip),
+                1,
+            );
+            ok(stats.devices)
         }
 
         // ---- Sites (hosts) ----
@@ -351,6 +368,9 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 upstream_timeout_secs: input.upstream_timeout_secs.unwrap_or(120),
                 block_crawler_ua: input.block_crawler_ua.unwrap_or(false),
                 rewrite_robots: input.rewrite_robots.unwrap_or(false),
+                blocked_countries: normalize_countries(input.blocked_countries),
+                block_datacenter: input.block_datacenter.unwrap_or(false),
+                cloudflare_only: input.cloudflare_only.unwrap_or(false),
                 enabled: input.enabled.unwrap_or(true),
                 created_at: now.clone(),
                 updated_at: now,
@@ -396,6 +416,15 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             }
             if let Some(v) = input.rewrite_robots {
                 s.rewrite_robots = v;
+            }
+            if let Some(v) = input.blocked_countries {
+                s.blocked_countries = normalize_countries(Some(v));
+            }
+            if let Some(v) = input.block_datacenter {
+                s.block_datacenter = v;
+            }
+            if let Some(v) = input.cloudflare_only {
+                s.cloudflare_only = v;
             }
             if let Some(v) = input.enabled {
                 s.enabled = v;
@@ -882,13 +911,16 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             let host = p.host;
             drop(store);
             let snap = state.logs.lock().snapshot();
-            let stats = collector::window_stats(
+            let mut stats = collector::window_stats(
                 &snap,
                 Utc::now(),
                 |l| l.host.eq_ignore_ascii_case(&host) && l.path.starts_with(&path),
                 |ip| state.waf.country_of(ip),
                 10,
             );
+            // Byte traffic is host-level (the meter keys on host), so a site's
+            // analytics shows the whole host's total / 30d / today.
+            stats.traffic = state.traffic.host_totals(&host);
             ok(stats)
         }
         "metrics.upstream" => ok(collector::metrics_upstream(&store)),
@@ -924,6 +956,22 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
 // ---------------------------------------------------------------------------
 // Small per-method helpers
 // ---------------------------------------------------------------------------
+
+/// Normalize a country-block list: trim, uppercase, keep only 2-letter ISO codes,
+/// drop blanks/dupes. Input may be `None` (→ empty list).
+fn normalize_countries(input: Option<Vec<String>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in input.unwrap_or_default() {
+        let code: String = c.trim().to_uppercase();
+        if code.len() == 2
+            && code.chars().all(|ch| ch.is_ascii_alphabetic())
+            && !out.contains(&code)
+        {
+            out.push(code);
+        }
+    }
+    out
+}
 
 fn set_route_enabled(store: &mut crate::state::Store, params: Value, enabled: bool) -> RpcResult {
     let p: IdParam = parse(params)?;
@@ -1219,6 +1267,9 @@ struct SiteInput {
     upstream_timeout_secs: Option<u64>,
     block_crawler_ua: Option<bool>,
     rewrite_robots: Option<bool>,
+    blocked_countries: Option<Vec<String>>,
+    block_datacenter: Option<bool>,
+    cloudflare_only: Option<bool>,
     enabled: Option<bool>,
 }
 

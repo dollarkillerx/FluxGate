@@ -18,9 +18,10 @@ use std::fmt::Write;
 
 use sha2::{Digest, Sha256};
 
-/// Proof-of-work difficulty as a hex-zero prefix (3 nibbles ≈ 12 bits ≈ 4096
-/// hashes average — instant in a browser, but real work, so no-JS clients fail).
-const DIFFICULTY: &str = "000";
+/// Proof-of-work difficulty as a hex-zero prefix (4 nibbles ≈ 16 bits ≈ 65536
+/// hashes average — still well under a second in a browser, but enough real work
+/// that scripted/no-JS clients won't grind it).
+const DIFFICULTY: &str = "0000";
 /// How long a solved clearance is accepted before re-challenging.
 const TTL_SECS: i64 = 1800;
 /// Cookie name carrying the clearance token.
@@ -80,26 +81,27 @@ fn cookie_value(header: &str, name: &str) -> Option<String> {
 pub fn page(secret: &str, now: i64) -> String {
     let seed = issue_seed(secret, now);
     PAGE_TEMPLATE
+        .replace("__STYLE__", crate::pages::STYLE)
+        .replace("__GLYPH__", crate::pages::GLYPH)
+        .replace("__REPO__", crate::pages::REPO)
         .replace("__SEED__", &seed)
         .replace("__DIFF__", DIFFICULTY)
         .replace("__COOKIE__", COOKIE)
         .replace("__TTL__", &TTL_SECS.to_string())
 }
 
-// A compact, self-contained interstitial. The embedded `sha256` is the
-// public-domain implementation by Geraint Luff (tiny-sha256), used for the
-// synchronous proof-of-work loop.
+// A compact, self-contained interstitial sharing the branded look of the block
+// pages (see `pages.rs`). The embedded `sha256` is the public-domain
+// implementation by Geraint Luff (tiny-sha256), used for the synchronous
+// proof-of-work loop.
 const PAGE_TEMPLATE: &str = r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex"><title>Checking your browser…</title>
-<style>html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;
-font:15px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;color:#1e293b;background:#f8fafc}
-.box{max-width:30rem;text-align:center;padding:2rem}.sp{width:34px;height:34px;margin:0 auto 1rem;
-border:3px solid #e2e8f0;border-top-color:#2563eb;border-radius:50%;animation:r .8s linear infinite}
-@keyframes r{to{transform:rotate(360deg)}}h1{font-size:1.15rem;margin:.25rem 0}p{color:#64748b;margin:.25rem 0}
-small{color:#94a3b8}</style></head><body><div class="box"><div class="sp"></div>
-<h1>Checking your browser</h1><p id="m">Running a quick security check…</p>
-<small>FluxGate WAF · managed challenge</small></div>
+<meta name="robots" content="noindex"><title>Checking your browser… · FluxGate</title>
+<style>:root{--accent:#60a5fa}__STYLE__</style></head>
+<body><div class="card"><div class="brand">__GLYPH__<span>FluxGate</span></div>
+<div class="sp"></div>
+<h1>Checking your browser</h1><p id="m">Running a quick security check before you continue…</p>
+<div class="foot">Protected by&nbsp;<a href="__REPO__" target="_blank" rel="noopener noreferrer">FluxGate</a></div></div>
 <script>
 function sha256(ascii){function rr(v,a){return (v>>>a)|(v<<(32-a));}var mp=Math.pow,mw=mp(2,32),res="",words=[],bitLen=ascii.length*8;var hash=sha256.h=sha256.h||[],k=sha256.k=sha256.k||[],pc=k.length,comp={};for(var cand=2;pc<64;cand++){if(!comp[cand]){for(var i=0;i<313;i+=cand)comp[i]=cand;hash[pc]=(mp(cand,.5)*mw)|0;k[pc++]=(mp(cand,1/3)*mw)|0;}}ascii+="\x80";while(ascii.length%64-56)ascii+="\x00";for(var i=0;i<ascii.length;i++){var j=ascii.charCodeAt(i);if(j>>8)return;words[i>>2]|=j<<((3-i)%4)*8;}words[words.length]=(bitLen/mw)|0;words[words.length]=bitLen;for(var j=0;j<words.length;){var w=words.slice(j,j+=16),oh=hash;hash=hash.slice(0,8);for(var i=0;i<64;i++){var w15=w[i-15],w2=w[i-2],a=hash[0],e=hash[4];var t1=hash[7]+(rr(e,6)^rr(e,11)^rr(e,25))+((e&hash[5])^((~e)&hash[6]))+k[i]+(w[i]=(i<16)?w[i]:(w[i-16]+(rr(w15,7)^rr(w15,18)^(w15>>>3))+w[i-7]+(rr(w2,17)^rr(w2,19)^(w2>>>10)))|0);var t2=(rr(a,2)^rr(a,13)^rr(a,22))+((a&hash[1])^(a&hash[2])^(hash[1]&hash[2]));hash=[(t1+t2)|0].concat(hash);hash[4]=(hash[4]+t1)|0;}for(var i=0;i<8;i++)hash[i]=(hash[i]+oh[i])|0;}for(var i=0;i<8;i++)for(var j=3;j+1;j--){var b=(hash[i]>>(j*8))&255;res+=((b<16)?"0":"")+b.toString(16);}return res;}
 (function(){var seed="__SEED__",diff="__DIFF__";

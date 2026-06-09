@@ -1,6 +1,6 @@
 import { useMemo } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Activity, Users, Gauge, AlertTriangle, Clock, Timer } from 'lucide-react'
+import { ArrowLeft, Activity, Users, Gauge, AlertTriangle, Clock, Timer, HardDrive, CalendarDays, Clock3 } from 'lucide-react'
 import { useRpc } from '@/hooks/useRpc'
 import { useI18n } from '@/i18n/I18nContext'
 import type { RouteStats } from '@/types'
@@ -10,7 +10,7 @@ import { StatCard } from '@/components/ui/StatCard'
 import { Card, CardBody, CardHeader } from '@/components/ui/Card'
 import { Spinner, ErrorState } from '@/components/ui/States'
 import { TrendChart, DonutChart } from '@/components/charts/Charts'
-import { formatNumber, flag, countryLabel } from '@/lib/utils'
+import { formatNumber, formatBytes, deviceIcon, flag, countryLabel } from '@/lib/utils'
 
 const REFRESH_MS = 5000
 
@@ -25,6 +25,11 @@ export function RouteAnalyticsPage() {
   const pie = useMemo(
     () => (data?.countries ?? []).map((c) => ({ name: c.country, value: c.requests })),
     [data?.countries],
+  )
+  const deviceLabel = (d: string) => t(`enum.device.${d}`)
+  const devicePie = useMemo(
+    () => (data?.devices ?? []).map((d) => ({ name: d.device, value: d.requests })),
+    [data?.devices],
   )
 
   return (
@@ -60,9 +65,18 @@ export function RouteAnalyticsPage() {
             <StatCard label={t('metrics.label.latency_p99')} value={`${data.latency_p99}ms`} sub="p99" icon={<Timer size={18} />} accent="amber" />
           </div>
 
+          {/* Site traffic (bytes): total / 30 days / today */}
+          {data.traffic ? (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <StatCard label={t('dashboard.trafficTotal')} value={formatBytes(data.traffic.total_bytes)} sub={t('dashboard.trafficTotalSub')} icon={<HardDrive size={18} />} accent="brand" />
+              <StatCard label={t('dashboard.traffic30d')} value={formatBytes(data.traffic.bytes_30d)} sub={t('dashboard.traffic30dSub')} icon={<CalendarDays size={18} />} accent="violet" />
+              <StatCard label={t('dashboard.trafficToday')} value={formatBytes(data.traffic.bytes_today)} sub={t('dashboard.trafficTodaySub')} icon={<Clock3 size={18} />} accent="emerald" />
+            </div>
+          ) : null}
+
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
             {/* 24h QPS */}
-            <Card className="lg:col-span-2">
+            <Card>
               <CardHeader title={t('routes.qps24hTitle')} description={t('routes.qps24hDesc')} />
               <CardBody>
                 <TrendChart
@@ -83,6 +97,18 @@ export function RouteAnalyticsPage() {
                   <p className="py-10 text-center text-sm text-slate-400">{t('dashboard.noGeo')}</p>
                 ) : (
                   <DonutChart data={pie} height={260} labelOf={(cc) => `${flag(cc)} ${countryLabel(cc, locale, t('dashboard.unknownCountry'))}`} />
+                )}
+              </CardBody>
+            </Card>
+
+            {/* Device / OS distribution (24h) */}
+            <Card>
+              <CardHeader title={t('dashboard.devicesTitle')} description={t('dashboard.devicesDesc')} />
+              <CardBody>
+                {devicePie.length === 0 ? (
+                  <p className="py-10 text-center text-sm text-slate-400">{t('dashboard.noDevices')}</p>
+                ) : (
+                  <DonutChart data={devicePie} height={260} labelOf={(d) => `${deviceIcon(d)} ${deviceLabel(d)}`} />
                 )}
               </CardBody>
             </Card>

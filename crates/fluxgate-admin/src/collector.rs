@@ -469,6 +469,8 @@ pub fn dashboard_summary(
         total_upstreams: cfg.total_upstreams,
         pv_24h,
         uv_24h: uniq.len() as u64,
+        // Filled by the RPC layer from the traffic meter.
+        traffic: TrafficTotals::default(),
     }
 }
 
@@ -522,6 +524,7 @@ pub fn window_stats(
     let mut uniq: HashSet<&str> = HashSet::new();
     let mut ip_country: HashMap<&str, String> = HashMap::new();
     let mut country_counts: HashMap<String, u64> = HashMap::new();
+    let mut device_counts: HashMap<&str, u64> = HashMap::new();
     let (mut pv, mut errors, mut recent60) = (0u64, 0u64, 0u64);
 
     for l in snap {
@@ -547,6 +550,12 @@ pub fn window_stats(
             .entry(l.client_ip.as_str())
             .or_insert_with(|| country_of(&l.client_ip).unwrap_or_else(|| "??".into()));
         *country_counts.entry(cc.clone()).or_default() += 1;
+        let dev = if l.device.is_empty() {
+            "unknown"
+        } else {
+            l.device.as_str()
+        };
+        *device_counts.entry(dev).or_default() += 1;
     }
 
     latencies.sort_unstable();
@@ -569,6 +578,14 @@ pub fn window_stats(
         .collect();
     countries.sort_by_key(|c| std::cmp::Reverse(c.requests));
     countries.truncate(top_countries);
+    let mut devices: Vec<DeviceStat> = device_counts
+        .into_iter()
+        .map(|(device, requests)| DeviceStat {
+            device: device.to_string(),
+            requests,
+        })
+        .collect();
+    devices.sort_by_key(|d| std::cmp::Reverse(d.requests));
 
     RouteStats {
         window_hours: WINDOW_HOURS as u32,
@@ -584,6 +601,9 @@ pub fn window_stats(
         latency_p99: pct(0.99),
         qps_series,
         countries,
+        devices,
+        // Host-level byte traffic is attached by the RPC layer (it owns the meter).
+        traffic: TrafficTotals::default(),
     }
 }
 
@@ -740,6 +760,7 @@ mod retention_tests {
             latency_ms: 5,
             upstream: "u".into(),
             waf_action: WafAction::Allow,
+            device: "windows".into(),
         }
     }
 

@@ -28,7 +28,7 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     Router,
 };
 use chrono::Utc;
@@ -145,12 +145,29 @@ async fn proxy_handler(
         .next()
         .unwrap_or("")
         .to_string();
+    // Real client IP: prefer Cloudflare's `CF-Connecting-IP`, then the first
+    // `X-Forwarded-For` hop, else the socket peer. (Gates that must not be
+    // spoofable — e.g. Cloudflare-only — use the raw `peer` instead.)
     let client_ip = headers
-        .get("x-forwarded-for")
+        .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
         .map(|s| s.trim().to_string())
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(',').next())
+                .map(|s| s.trim().to_string())
+        })
         .unwrap_or_else(|| peer.ip().to_string());
+    // Device/OS class for the dashboard breakdown — parsed once, logged on every
+    // request below (a `&'static str`, so it's cheap to pass around).
+    let device = device_class(
+        headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+    );
 
     // --- ACME HTTP-01 challenge ---------------------------------------------
     // Served BEFORE any routing/redirect so certificate issuance never disrupts
@@ -169,6 +186,7 @@ async fn proxy_handler(
                 started,
                 "acme-http-01",
                 WafAction::Allow,
+                device,
             );
             return (
                 StatusCode::OK,
@@ -194,6 +212,7 @@ async fn proxy_handler(
                 started,
                 "-",
                 WafAction::Allow,
+                device,
             );
             return Response::builder()
                 .status(StatusCode::PERMANENT_REDIRECT)
@@ -214,8 +233,9 @@ async fn proxy_handler(
                 started,
                 "-",
                 WafAction::Allow,
+                device,
             );
-            return (StatusCode::NOT_FOUND, "No matching route").into_response();
+            return (StatusCode::NOT_FOUND, Html(crate::pages::not_found())).into_response();
         }
         RouteOutcome::NoHealthyUpstream => {
             log_request(
@@ -228,8 +248,13 @@ async fn proxy_handler(
                 started,
                 "-",
                 WafAction::Allow,
+                device,
             );
-            return (StatusCode::BAD_GATEWAY, "No healthy upstream").into_response();
+            return (
+                StatusCode::BAD_GATEWAY,
+                Html(crate::pages::upstream_unavailable()),
+            )
+                .into_response();
         }
     };
     // Bind the fields as locals so the rest of the handler reads naturally;
@@ -243,7 +268,97 @@ async fn proxy_handler(
         upstream_timeout_secs,
         block_crawler_ua,
         rewrite_robots,
+        blocked_countries,
+        block_datacenter,
+        cloudflare_only,
     } = target;
+
+    // --- Site IP access controls (site Advanced options) --------------------
+    // The geo / datacenter gates must judge the *real* client, not a spoofable
+    // header: `CF-Connecting-IP` is trusted only when the connection genuinely
+    // came from a Cloudflare edge (peer ∈ CF ranges); otherwise the socket peer is
+    // used. Without this, a direct visitor could set `CF-Connecting-IP` to a
+    // permitted country / residential IP and walk past a region or datacenter
+    // block. Computed only when one of those gates is active.
+    let gate_ip = if !blocked_countries.is_empty() || block_datacenter {
+        if state.cf_ranges.contains(peer.ip()) {
+            headers
+                .get("cf-connecting-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| peer.ip().to_string())
+        } else {
+            peer.ip().to_string()
+        }
+    } else {
+        String::new()
+    };
+
+    // Cloudflare-only: the connection must originate from a Cloudflare edge. We
+    // check the raw TCP **peer** (a forwarded header would be spoofable), so this
+    // blocks direct-to-origin bypass attempts.
+    if cloudflare_only && !state.cf_ranges.contains(peer.ip()) {
+        log_request(
+            &state,
+            &client_ip,
+            &method,
+            &host,
+            &path,
+            403,
+            started,
+            "-",
+            WafAction::Deny,
+            device,
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Html(crate::pages::block_cloudflare()),
+        )
+            .into_response();
+    }
+    // Geo block: deny configured countries (judged on the trusted gate IP).
+    if !blocked_countries.is_empty() {
+        if let Some(cc) = state.waf.country_of(&gate_ip) {
+            if blocked_countries
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(&cc))
+            {
+                log_request(
+                    &state,
+                    &client_ip,
+                    &method,
+                    &host,
+                    &path,
+                    403,
+                    started,
+                    "-",
+                    WafAction::Deny,
+                    device,
+                );
+                return (StatusCode::FORBIDDEN, Html(crate::pages::block_region())).into_response();
+            }
+        }
+    }
+    // Datacenter / cloud block ("non-residential"): deny known hosting ASNs.
+    if block_datacenter && state.waf.is_datacenter(&gate_ip) {
+        log_request(
+            &state,
+            &client_ip,
+            &method,
+            &host,
+            &path,
+            403,
+            started,
+            "-",
+            WafAction::Deny,
+            device,
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Html(crate::pages::block_datacenter()),
+        )
+            .into_response();
+    }
 
     // --- Crawler controls (site Advanced options) ---------------------------
     // Serve a disallow-all robots.txt instead of proxying it to the origin.
@@ -258,6 +373,7 @@ async fn proxy_handler(
             started,
             "-",
             WafAction::Allow,
+            device,
         );
         return (
             StatusCode::OK,
@@ -278,8 +394,9 @@ async fn proxy_handler(
             started,
             "-",
             WafAction::Deny,
+            device,
         );
-        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+        return (StatusCode::FORBIDDEN, Html(crate::pages::block_crawler())).into_response();
     }
 
     // --- WAF enforcement (only when the matched path has WAF enabled) --------
@@ -318,8 +435,9 @@ async fn proxy_handler(
                     started,
                     "-",
                     decision.action,
+                    device,
                 );
-                return (StatusCode::FORBIDDEN, "Forbidden by WAF").into_response();
+                return (StatusCode::FORBIDDEN, Html(crate::pages::block_waf())).into_response();
             }
             WafAction::Challenge => {
                 // A real managed challenge: clients that already solved the
@@ -339,6 +457,7 @@ async fn proxy_handler(
                         started,
                         "-",
                         decision.action,
+                        device,
                     );
                     let html = crate::challenge::page(&state.config.admin_token, now_ts);
                     return (StatusCode::SERVICE_UNAVAILABLE, axum::response::Html(html))
@@ -367,6 +486,7 @@ async fn proxy_handler(
                     started,
                     &upstream_name,
                     WafAction::Allow,
+                    device,
                 );
                 return (StatusCode::PAYLOAD_TOO_LARGE, "Request body too large").into_response();
             }
@@ -417,8 +537,10 @@ async fn proxy_handler(
                                 started,
                                 "-",
                                 decision.action,
+                                device,
                             );
-                            return (StatusCode::FORBIDDEN, "Forbidden by WAF").into_response();
+                            return (StatusCode::FORBIDDEN, Html(crate::pages::block_waf()))
+                                .into_response();
                         }
                         WafAction::Challenge => {
                             let now_ts = Utc::now().timestamp();
@@ -439,6 +561,7 @@ async fn proxy_handler(
                                     started,
                                     "-",
                                     decision.action,
+                                    device,
                                 );
                                 let html =
                                     crate::challenge::page(&state.config.admin_token, now_ts);
@@ -466,6 +589,7 @@ async fn proxy_handler(
                     started,
                     "-",
                     WafAction::Allow,
+                    device,
                 );
                 return (StatusCode::BAD_REQUEST, "Malformed request body").into_response();
             }
@@ -481,6 +605,7 @@ async fn proxy_handler(
                     started,
                     "-",
                     WafAction::Allow,
+                    device,
                 );
                 return (StatusCode::REQUEST_TIMEOUT, "Request body read timed out")
                     .into_response();
@@ -550,6 +675,7 @@ async fn proxy_handler(
                 started,
                 &upstream_name,
                 WafAction::Allow,
+                device,
             );
             return (status, msg).into_response();
         }
@@ -564,6 +690,7 @@ async fn proxy_handler(
                 started,
                 &upstream_name,
                 WafAction::Allow,
+                device,
             );
             return (StatusCode::GATEWAY_TIMEOUT, "Upstream timed out").into_response();
         }
@@ -604,6 +731,7 @@ async fn proxy_handler(
             started,
             &upstream_name,
             WafAction::Allow,
+            device,
         );
         return client_resp;
     }
@@ -620,6 +748,7 @@ async fn proxy_handler(
         started,
         &upstream_name,
         WafAction::Allow,
+        device,
     );
     let mut rb = Response::builder().status(status);
     for (name, value) in resp.headers() {
@@ -627,7 +756,18 @@ async fn proxy_handler(
             rb = rb.header(name, value);
         }
     }
-    rb.body(Body::new(resp.into_body()))
+    // Meter site traffic: request body bytes (Content-Length) plus the response
+    // bytes actually streamed back. Counted as the body flows, recorded once when
+    // it ends or is dropped — so a client that disconnects mid-download still
+    // contributes the bytes it received.
+    let req_bytes = content_length(&headers).unwrap_or(0);
+    let metered = MeteredBody::new(
+        Body::new(resp.into_body()),
+        state.traffic.clone(),
+        host.clone(),
+        req_bytes,
+    );
+    rb.body(Body::new(metered))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
@@ -681,6 +821,10 @@ struct Target {
     /// Site crawler controls (Advanced options).
     block_crawler_ua: bool,
     rewrite_robots: bool,
+    /// Site IP access controls (Advanced options).
+    blocked_countries: Vec<String>,
+    block_datacenter: bool,
+    cloudflare_only: bool,
 }
 
 /// Resolve `host` → enabled site → longest-prefix enabled path route, then a
@@ -718,6 +862,9 @@ fn pick_target(
     let upstream_timeout_secs = site.upstream_timeout_secs;
     let block_crawler_ua = site.block_crawler_ua;
     let rewrite_robots = site.rewrite_robots;
+    let blocked_countries = site.blocked_countries.clone();
+    let block_datacenter = site.block_datacenter;
+    let cloudflare_only = site.cloudflare_only;
     let mut cursor = state.lb_cursor.lock();
     match select_node(upstream, client_ip, &mut cursor) {
         Some(address) => RouteOutcome::Found(Target {
@@ -729,6 +876,9 @@ fn pick_target(
             upstream_timeout_secs,
             block_crawler_ua,
             rewrite_robots,
+            blocked_countries,
+            block_datacenter,
+            cloudflare_only,
         }),
         None => RouteOutcome::NoHealthyUpstream,
     }
@@ -994,6 +1144,112 @@ async fn read_body_prefix(
     Ok((buffered, inspect, body, complete))
 }
 
+/// Wraps the proxied response body to tally site traffic (request + response
+/// bytes) into the per-host meter. The byte count is recorded exactly once — when
+/// the stream ends or the body is dropped (e.g. the client disconnects
+/// mid-download), whichever happens first.
+struct MeteredBody {
+    inner: Body,
+    meter: Arc<crate::traffic::TrafficMeter>,
+    host: String,
+    bytes: u64,
+    recorded: bool,
+}
+
+impl MeteredBody {
+    fn new(
+        inner: Body,
+        meter: Arc<crate::traffic::TrafficMeter>,
+        host: String,
+        initial: u64,
+    ) -> Self {
+        Self {
+            inner,
+            meter,
+            host,
+            bytes: initial,
+            recorded: false,
+        }
+    }
+
+    fn record(&mut self) {
+        if !self.recorded {
+            self.recorded = true;
+            self.meter.add(&self.host, self.bytes);
+        }
+    }
+}
+
+impl HttpBody for MeteredBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(d) = frame.data_ref() {
+                    this.bytes = this.bytes.saturating_add(d.len() as u64);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(None) => {
+                this.record();
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+}
+
+impl Drop for MeteredBody {
+    fn drop(&mut self) {
+        self.record();
+    }
+}
+
+/// Classify a User-Agent into a coarse device / OS bucket for the dashboard's
+/// device breakdown. Order matters: bots first, then mobile OSes (whose UAs also
+/// name a desktop OS — Android contains "Linux", iOS contains "Mac OS").
+fn device_class(ua: &str) -> &'static str {
+    let u = ua.to_ascii_lowercase();
+    if u.is_empty() {
+        return "unknown";
+    }
+    if u.contains("bot")
+        || u.contains("spider")
+        || u.contains("crawl")
+        || u.contains("slurp")
+        || u.contains("curl")
+        || u.contains("wget")
+        || u.contains("python")
+        || u.contains("go-http")
+        || u.contains("java/")
+        || u.contains("okhttp")
+    {
+        return "bot";
+    }
+    if u.contains("android") {
+        return "android";
+    }
+    if u.contains("iphone") || u.contains("ipad") || u.contains("ipod") {
+        return "ios";
+    }
+    if u.contains("windows") {
+        return "windows";
+    }
+    if u.contains("mac os") || u.contains("macintosh") {
+        return "mac";
+    }
+    if u.contains("linux") || u.contains("x11") {
+        return "linux";
+    }
+    "other"
+}
+
 #[allow(clippy::too_many_arguments)]
 fn log_request(
     state: &AppState,
@@ -1005,6 +1261,7 @@ fn log_request(
     started: Instant,
     upstream: &str,
     waf_action: WafAction,
+    device: &str,
 ) {
     let entry = AccessLog {
         id: format!("px-{}", Utc::now().timestamp_millis()),
@@ -1017,6 +1274,7 @@ fn log_request(
         latency_ms: started.elapsed().as_millis() as u32,
         upstream: upstream.to_string(),
         waf_action,
+        device: device.to_string(),
     };
     state.logs.lock().record(entry);
 }
@@ -1211,7 +1469,7 @@ mod tests {
     async fn bench_body_pipeline() {
         use std::hint::black_box;
         use std::time::Instant;
-        let engine = crate::waf::WafEngine::new(None);
+        let engine = crate::waf::WafEngine::new(None, None);
         engine.rebuild(&crate::persist::default_waf_rules());
 
         for (label, payload) in [

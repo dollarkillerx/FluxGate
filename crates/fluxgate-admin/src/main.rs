@@ -26,7 +26,10 @@ mod acme;
 mod assets;
 mod auth;
 mod challenge;
+mod cloudflare;
 mod collector;
+mod iprange;
+mod pages;
 mod persist;
 mod proxy;
 mod rpc;
@@ -34,6 +37,7 @@ mod serve;
 mod state;
 mod throttle;
 mod tls;
+mod traffic;
 mod waf;
 mod waf_packs;
 
@@ -74,6 +78,8 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(6)
             .max(1),
         geoip_path: resolve_geoip_path(),
+        asn_path: resolve_asn_path(),
+        traffic_path: resolve_opt_path("FLUXGATE_TRAFFIC_FILE", "fluxgate-traffic.json"),
     };
     if let Err(e) = std::fs::create_dir_all(&config.cert_dir) {
         tracing::warn!(
@@ -246,6 +252,19 @@ fn spawn_background_tasks(state: AppState) {
             }
         }
     });
+
+    // Traffic totals: persist (and prune >31d daily buckets) every 30s, so the
+    // per-site total / 30d / today figures survive restarts. The in-memory meter
+    // is updated live by the data plane; this just snapshots it to disk.
+    let traffic = state.traffic.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            ticker.tick().await;
+            let traffic = traffic.clone();
+            let _ = tokio::task::spawn_blocking(move || traffic.flush()).await;
+        }
+    });
 }
 
 /// Assemble the full HTTP router: API routes + embedded static assets.
@@ -346,10 +365,12 @@ fn resolve_geoip_path() -> Option<PathBuf> {
         Ok(v) => PathBuf::from(v),
         Err(_) => PathBuf::from("fluxgate-geoip/GeoLite2-Country.mmdb"),
     };
+    const URL: &str =
+        "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb";
     if path.exists() {
         return Some(path);
     }
-    match download_geoip(&path) {
+    match download_geoip(&path, URL, "GeoIP country") {
         Ok(()) => Some(path),
         Err(e) => {
             tracing::warn!(
@@ -360,12 +381,33 @@ fn resolve_geoip_path() -> Option<PathBuf> {
     }
 }
 
-/// Fetch the GeoLite2-Country database from the P3TERX mirror to `dest`
-/// (atomic via a temp file). Blocking; only runs once, at first start.
-fn download_geoip(dest: &std::path::Path) -> anyhow::Result<()> {
+/// GeoLite2-**ASN** database path (for the per-site datacenter/cloud block):
+/// `FLUXGATE_ASN_DB` set → that path · empty → disabled · unset → default
+/// `fluxgate-geoip/GeoLite2-ASN.mmdb`, auto-downloaded from the same mirror.
+fn resolve_asn_path() -> Option<PathBuf> {
+    let path = match std::env::var("FLUXGATE_ASN_DB") {
+        Ok(v) if v.is_empty() => return None,
+        Ok(v) => PathBuf::from(v),
+        Err(_) => PathBuf::from("fluxgate-geoip/GeoLite2-ASN.mmdb"),
+    };
     const URL: &str =
-        "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb";
-    tracing::info!("GeoIP database not found — downloading from P3TERX/GeoLite.mmdb …");
+        "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-ASN.mmdb";
+    if path.exists() {
+        return Some(path);
+    }
+    match download_geoip(&path, URL, "GeoIP ASN") {
+        Ok(()) => Some(path),
+        Err(e) => {
+            tracing::warn!("ASN database auto-download failed: {e} — datacenter blocking disabled");
+            None
+        }
+    }
+}
+
+/// Fetch an mmdb database from `url` to `dest` (atomic via a temp file). Blocking;
+/// only runs once, at first start. `what` labels it in logs.
+fn download_geoip(dest: &std::path::Path, url: &str, what: &str) -> anyhow::Result<()> {
+    tracing::info!("{what} database not found — downloading from P3TERX/GeoLite.mmdb …");
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -375,7 +417,7 @@ fn download_geoip(dest: &std::path::Path) -> anyhow::Result<()> {
             .timeout_connect(Duration::from_secs(10))
             .timeout(Duration::from_secs(45))
             .build();
-        let resp = agent.get(URL).call()?;
+        let resp = agent.get(url).call()?;
         let mut file = std::fs::File::create(&tmp)?;
         let bytes = std::io::copy(&mut resp.into_reader(), &mut file)?;
         file.sync_all().ok();
@@ -385,7 +427,7 @@ fn download_geoip(dest: &std::path::Path) -> anyhow::Result<()> {
         Ok(bytes) => {
             std::fs::rename(&tmp, dest)?;
             tracing::info!(
-                "GeoIP database downloaded ({} KB) → {}",
+                "{what} database downloaded ({} KB) → {}",
                 bytes / 1024,
                 dest.display()
             );

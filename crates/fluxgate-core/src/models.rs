@@ -40,6 +40,18 @@ pub struct Site {
     /// Serve a disallow-all `robots.txt` instead of proxying it to the origin.
     #[serde(default)]
     pub rewrite_robots: bool,
+    /// Deny clients whose GeoIP country is in this list (ISO-3166-1 alpha-2 codes).
+    /// Empty = no geo restriction. Uses the real client IP (CF-Connecting-IP aware).
+    #[serde(default)]
+    pub blocked_countries: Vec<String>,
+    /// Deny clients on known datacenter / cloud / hosting ASNs (the "block
+    /// non-residential" control). Requires the GeoLite2-ASN database.
+    #[serde(default)]
+    pub block_datacenter: bool,
+    /// Only accept connections originating from Cloudflare's IP ranges (the site
+    /// must be fronted by Cloudflare). Checked against the **TCP peer**, not headers.
+    #[serde(default)]
+    pub cloudflare_only: bool,
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -217,6 +229,10 @@ pub struct AccessLog {
     pub latency_ms: u32,
     pub upstream: String,
     pub waf_action: WafAction,
+    /// Client device / OS class parsed from the User-Agent at log time
+    /// (`windows` / `mac` / `linux` / `android` / `ios` / `bot` / `other`).
+    #[serde(default)]
+    pub device: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +252,9 @@ pub struct DashboardSummary {
     pub pv_24h: u64,
     /// Unique visitors (distinct client IPs) in the last 24 hours.
     pub uv_24h: u64,
+    /// Whole-proxy byte traffic: cumulative / last 30 days / today.
+    #[serde(default)]
+    pub traffic: TrafficTotals,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +279,24 @@ pub struct CountryStat {
     pub requests: u64,
 }
 
+/// Request count grouped by client device / OS class (parsed from User-Agent):
+/// `windows` / `mac` / `linux` / `android` / `ios` / `bot` / `other`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStat {
+    pub device: String,
+    pub requests: u64,
+}
+
+/// Byte-traffic totals for a site (or the whole proxy): cumulative, last 30 days,
+/// and today. `total_requests` is the cumulative metered response count.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrafficTotals {
+    pub total_bytes: u64,
+    pub bytes_30d: u64,
+    pub bytes_today: u64,
+    pub total_requests: u64,
+}
+
 /// 24-hour analytics for a host+path (or the whole proxy), bucketed hourly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteStats {
@@ -276,6 +313,12 @@ pub struct RouteStats {
     pub qps_series: Vec<MetricPoint>,
     /// Visitor-country breakdown (top N), for the pie chart.
     pub countries: Vec<CountryStat>,
+    /// Client device / OS breakdown over the window (from User-Agent).
+    #[serde(default)]
+    pub devices: Vec<DeviceStat>,
+    /// Byte-traffic totals for this site (host-level: cumulative / 30d / today).
+    #[serde(default)]
+    pub traffic: TrafficTotals,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

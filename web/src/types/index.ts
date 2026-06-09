@@ -23,6 +23,12 @@ export interface Site {
   block_crawler_ua?: boolean
   /** Serve a disallow-all robots.txt instead of proxying it. */
   rewrite_robots?: boolean
+  /** Deny clients from these ISO-3166-1 alpha-2 countries (GeoIP). */
+  blocked_countries?: string[]
+  /** Deny clients on known datacenter/cloud/hosting ASNs. */
+  block_datacenter?: boolean
+  /** Only accept connections from Cloudflare IP ranges. */
+  cloudflare_only?: boolean
   enabled: boolean
   created_at: string
   updated_at: string
@@ -120,6 +126,7 @@ export interface DashboardSummary {
   total_upstreams: number
   pv_24h: number
   uv_24h: number
+  traffic?: TrafficTotals
 }
 
 export interface TrafficPoint {
@@ -143,6 +150,20 @@ export interface DashboardTraffic {
 export interface CountryStat {
   country: string
   requests: number
+}
+
+/** Request count by client device/OS class parsed from the User-Agent. */
+export interface DeviceStat {
+  device: string
+  requests: number
+}
+
+/** Byte-traffic totals for a site (or the whole proxy). */
+export interface TrafficTotals {
+  total_bytes: number
+  bytes_30d: number
+  bytes_today: number
+  total_requests: number
 }
 
 export interface MetricPoint {
@@ -169,6 +190,8 @@ export interface RouteStats {
   latency_p99: number
   qps_series: MetricPoint[]
   countries: CountryStat[]
+  devices?: DeviceStat[]
+  traffic?: TrafficTotals
 }
 
 export interface AcmeSettings {

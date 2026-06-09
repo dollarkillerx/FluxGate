@@ -16,6 +16,23 @@ export function formatFull(n: number): string {
   return n.toLocaleString('en-US')
 }
 
+/** Byte count -> human size: 1536 -> "1.5 KB", 0 -> "0 B". */
+export function formatBytes(n: number): string {
+  if (!n || n < 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+  const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), units.length - 1)
+  const v = n / Math.pow(1024, i)
+  return `${v.toFixed(i === 0 ? 0 : v < 10 ? 2 : 1)} ${units[i]}`
+}
+
+/** Emoji for a device/OS class (windows/mac/linux/android/ios/bot/…). */
+export function deviceIcon(d: string): string {
+  const m: Record<string, string> = {
+    windows: '🪟', mac: '🍎', linux: '🐧', android: '🤖', ios: '📱', bot: '🤖', other: '💻', unknown: '❓',
+  }
+  return m[d] ?? '💻'
+}
+
 /** ISO timestamp -> "Jun 7, 14:32:08". */
 export function formatTime(iso: string): string {
   const d = new Date(iso)

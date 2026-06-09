@@ -19,7 +19,6 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -54,52 +53,9 @@ const MAX_RATE_KEYS: usize = 100_000;
 // Compiled rule forms (built once by `rebuild`)
 // ---------------------------------------------------------------------------
 
-/// Pre-parsed IPv4 matcher (exact address or CIDR network).
-enum IpMatcher {
-    Exact(u32),
-    Cidr { net: u32, mask: u32 },
-    Never,
-}
-
-impl IpMatcher {
-    fn parse(pattern: &str) -> Self {
-        let pattern = pattern.trim();
-        if let Some((base, bits)) = pattern.split_once('/') {
-            let (Ok(net), Ok(bits)) = (base.trim().parse::<Ipv4Addr>(), bits.trim().parse::<u8>())
-            else {
-                return IpMatcher::Never;
-            };
-            if bits > 32 {
-                return IpMatcher::Never;
-            }
-            let mask = if bits == 0 {
-                0
-            } else {
-                u32::MAX << (32 - bits)
-            };
-            return IpMatcher::Cidr {
-                net: u32::from(net) & mask,
-                mask,
-            };
-        }
-        match pattern.parse::<Ipv4Addr>() {
-            Ok(ip) => IpMatcher::Exact(u32::from(ip)),
-            Err(_) => IpMatcher::Never,
-        }
-    }
-
-    fn matches(&self, client: &str) -> bool {
-        let Ok(ip) = client.parse::<Ipv4Addr>() else {
-            return false;
-        };
-        let ip = u32::from(ip);
-        match self {
-            IpMatcher::Exact(e) => *e == ip,
-            IpMatcher::Cidr { net, mask } => (ip & mask) == *net,
-            IpMatcher::Never => false,
-        }
-    }
-}
+// Dual-stack IP/CIDR matching lives in `iprange` (shared with the per-site
+// access controls). `Matcher::Ip` wraps an `iprange::IpMatcher`.
+use crate::iprange::IpMatcher;
 
 /// Compiled GeoIP matcher: `country in [..]` (or `not in` / `==` / `!=`).
 struct GeoMatcher {
@@ -242,20 +198,27 @@ pub struct WafEngine {
     /// Optional GeoIP country database (MaxMind `.mmdb`). When absent, `geo`
     /// rules never match.
     geo: Option<maxminddb::Reader<Vec<u8>>>,
+    /// Optional GeoLite2-ASN database. When absent, `is_datacenter` is always false.
+    asn: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
 impl WafEngine {
-    /// Create an engine, optionally with a loaded GeoIP database for `geo` rules.
-    pub fn new(geo: Option<maxminddb::Reader<Vec<u8>>>) -> Self {
+    /// Create an engine, optionally with loaded GeoIP country + ASN databases.
+    pub fn new(
+        geo: Option<maxminddb::Reader<Vec<u8>>>,
+        asn: Option<maxminddb::Reader<Vec<u8>>>,
+    ) -> Self {
         Self {
             compiled: RwLock::new(Arc::new(CompiledRuleSet::default())),
             rate: Mutex::new(HashMap::new()),
             hits: Mutex::new(HashMap::new()),
             geo,
+            asn,
         }
     }
 
-    /// Load a GeoIP country database from a `.mmdb` file (best effort).
+    /// Load a MaxMind `.mmdb` reader from a file (best effort). Used for both the
+    /// country and ASN databases.
     pub fn load_geoip(path: &std::path::Path) -> Option<maxminddb::Reader<Vec<u8>>> {
         let bytes = std::fs::read(path).ok()?;
         maxminddb::Reader::from_source(bytes).ok()
@@ -337,7 +300,7 @@ impl WafEngine {
 
     fn matches(&self, m: &Matcher, ctx: &WafContext, norm_path: &str, now_sec: u64) -> bool {
         match m {
-            Matcher::Ip(ip) => ip.matches(ctx.client_ip),
+            Matcher::Ip(ip) => ip.matches_str(ctx.client_ip),
             Matcher::Path(re) => re.is_match(norm_path),
             Matcher::Method(re) => re.is_match(ctx.method),
             Matcher::Header { name, re } => {
@@ -403,7 +366,64 @@ impl WafEngine {
             None => false,
         }
     }
+
+    /// Resolve a client IP's autonomous-system number via the GeoLite2-ASN DB.
+    pub fn asn_of(&self, client_ip: &str) -> Option<u32> {
+        let reader = self.asn.as_ref()?;
+        let ip = client_ip.parse::<std::net::IpAddr>().ok()?;
+        reader
+            .lookup::<maxminddb::geoip2::Asn>(ip)
+            .ok()
+            .and_then(|a| a.autonomous_system_number)
+    }
+
+    /// Whether the client IP belongs to a known datacenter / cloud / hosting ASN
+    /// (the "not residential" approximation). `false` when the ASN DB is absent or
+    /// the IP isn't in the blocklist — so private / unknown addresses pass.
+    pub fn is_datacenter(&self, client_ip: &str) -> bool {
+        match self.asn_of(client_ip) {
+            Some(asn) => DATACENTER_ASNS.binary_search(&asn).is_ok(),
+            None => false,
+        }
+    }
 }
+
+/// Well-known datacenter / cloud / hosting ASNs — the basis of the per-site
+/// "block non-residential" control. **Kept sorted** for `binary_search`.
+///
+/// This is an honest approximation: it reliably catches the major clouds and VPS
+/// providers, but can't cover every small host or residential-proxy network.
+/// Treat it as "block known datacenter/cloud sources", not a guarantee of
+/// residential-only traffic.
+const DATACENTER_ASNS: &[u32] = &[
+    8068,   // Microsoft
+    8075,   // Microsoft / Azure
+    9009,   // M247
+    13335,  // Cloudflare
+    14061,  // DigitalOcean
+    14525,  // DigitalOcean
+    14618,  // Amazon AWS
+    15169,  // Google
+    16276,  // OVH
+    16509,  // Amazon AWS
+    20473,  // Vultr / Choopa
+    24940,  // Hetzner
+    31898,  // Oracle Cloud
+    36352,  // ColoCrossing
+    37963,  // Alibaba Cloud (CN)
+    45090,  // Tencent Cloud
+    45102,  // Alibaba Cloud (intl)
+    49981,  // WorldStream
+    51167,  // Contabo
+    53667,  // FranTech / BuyVM
+    60781,  // LeaseWeb
+    62567,  // DigitalOcean
+    63949,  // Linode / Akamai
+    132203, // Tencent
+    209242, // Cloudflare
+    393406, // DigitalOcean
+    396982, // Google Cloud
+];
 
 // ---------------------------------------------------------------------------
 // Request-target normalization (anti-evasion)
@@ -509,7 +529,7 @@ mod tests {
     }
 
     fn engine_with(rules: &[WafRule]) -> WafEngine {
-        let e = WafEngine::new(None);
+        let e = WafEngine::new(None, None);
         e.rebuild(rules);
         e
     }
@@ -528,14 +548,46 @@ mod tests {
         }
     }
 
+    // IP/CIDR matching (v4 + v6) is tested in `iprange`; here we only cover the
+    // engine wiring through `Matcher::Ip`.
     #[test]
-    fn ip_cidr_and_exact() {
-        assert!(IpMatcher::parse("10.0.0.0/24").matches("10.0.0.5"));
-        assert!(!IpMatcher::parse("10.0.0.0/24").matches("10.0.1.5"));
-        assert!(IpMatcher::parse("10.0.0.5").matches("10.0.0.5"));
-        assert!(!IpMatcher::parse("10.0.0.5").matches("10.0.0.6"));
-        assert!(IpMatcher::parse("0.0.0.0/0").matches("1.2.3.4"));
-        assert!(!IpMatcher::parse("not-an-ip").matches("1.2.3.4"));
+    fn datacenter_asns_are_sorted_and_unique() {
+        // `is_datacenter` uses binary_search, which is only correct on a sorted
+        // list. Guard against an out-of-order edit.
+        let mut sorted = DATACENTER_ASNS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted, DATACENTER_ASNS,
+            "DATACENTER_ASNS must stay sorted + unique for binary_search"
+        );
+    }
+
+    #[test]
+    fn ip_rule_matches_v4_and_v6() {
+        let h = HashMap::new();
+        let engine = engine_with(&[
+            rule(WafMatchType::Ip, "10.0.0.0/24", WafAction::Deny),
+            rule(WafMatchType::Ip, "2400:cb00::/32", WafAction::Deny),
+        ]);
+        assert_eq!(
+            engine
+                .evaluate(WafAction::Allow, &ctx("10.0.0.9", "GET", "/", &h), 0)
+                .action,
+            WafAction::Deny
+        );
+        assert_eq!(
+            engine
+                .evaluate(WafAction::Allow, &ctx("2400:cb00::1", "GET", "/", &h), 0)
+                .action,
+            WafAction::Deny
+        );
+        assert_eq!(
+            engine
+                .evaluate(WafAction::Allow, &ctx("8.8.8.8", "GET", "/", &h), 0)
+                .action,
+            WafAction::Allow
+        );
     }
 
     #[test]
@@ -608,7 +660,7 @@ mod tests {
         // benign case (every path matches the `/` prefix) and mask the true
         // full-traversal regex cost we want to measure.
         rules.retain(|r| !matches!(r.match_type, WafMatchType::RateLimit));
-        let engine = WafEngine::new(None);
+        let engine = WafEngine::new(None, None);
         engine.rebuild(&rules);
         let h = HashMap::new();
         let iters = 1_000_000u32;
@@ -645,7 +697,7 @@ mod tests {
     fn bench_evaluate_body() {
         use std::hint::black_box;
         use std::time::Instant;
-        let engine = WafEngine::new(None);
+        let engine = WafEngine::new(None, None);
         engine.rebuild(&crate::persist::default_waf_rules());
         let iters = 1_000_000u32;
 

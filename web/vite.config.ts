@@ -17,8 +17,10 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/rpc': { target: 'http://127.0.0.1:8080', changeOrigin: true },
-      '/health': { target: 'http://127.0.0.1:8080', changeOrigin: true },
+      // The Rust admin server is HTTPS (self-signed) — target https and skip
+      // cert verification so `npm run dev` reaches it.
+      '/rpc': { target: 'https://127.0.0.1:8080', changeOrigin: true, secure: false },
+      '/health': { target: 'https://127.0.0.1:8080', changeOrigin: true, secure: false },
     },
   },
 })

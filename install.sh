@@ -24,11 +24,13 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DOWNLOAD_URL="https://github.com/dollarkillerx/FluxGate/releases/download/v0.1.3/fluxgate-admin-0.1.0-x86_64-linux-musl.tar.gz"
+DOWNLOAD_URL="https://github.com/dollarkillerx/FluxGate/releases/download/v0.1.4/fluxgate-admin-0.1.0-x86_64-linux-musl.tar.gz"
 GEO_URL="https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb"
+ASN_URL="https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-ASN.mmdb"
 INSTALL_BIN="/usr/local/bin/fluxgate-admin"
 DATA_DIR="/var/lib/fluxgate"
 GEO_FILE="${DATA_DIR}/geoip/GeoLite2-Country.mmdb"
+ASN_FILE="${DATA_DIR}/geoip/GeoLite2-ASN.mmdb"
 ETC_DIR="/etc/fluxgate"
 ENV_FILE="${ETC_DIR}/fluxgate.env"
 SVC_NAME="fluxgate-admin"
@@ -333,14 +335,21 @@ act_restart(){
 download_geo(){
   echo "$(t geo_dl)"
   mkdir -p "$(dirname "$GEO_FILE")"
+  local ok_any=0
+  # Country database (GeoIP / geo rules / country block).
   if curl -fL --progress-bar --max-time 60 -o "${GEO_FILE}.tmp" "$GEO_URL"; then
-    mv -f "${GEO_FILE}.tmp" "$GEO_FILE"
-    id "$SVC_USER" >/dev/null 2>&1 && chown -R "$SVC_USER:$SVC_USER" "$(dirname "$GEO_FILE")" 2>/dev/null || true
-    ok "$(t geo_done)"
+    mv -f "${GEO_FILE}.tmp" "$GEO_FILE"; ok_any=1
   else
     rm -f "${GEO_FILE}.tmp"
-    warn "$(t geo_fail)"
   fi
+  # ASN database (datacenter / cloud IP blocking).
+  if curl -fL --progress-bar --max-time 60 -o "${ASN_FILE}.tmp" "$ASN_URL"; then
+    mv -f "${ASN_FILE}.tmp" "$ASN_FILE"; ok_any=1
+  else
+    rm -f "${ASN_FILE}.tmp"
+  fi
+  id "$SVC_USER" >/dev/null 2>&1 && chown -R "$SVC_USER:$SVC_USER" "$(dirname "$GEO_FILE")" 2>/dev/null || true
+  if [ "$ok_any" = "1" ]; then ok "$(t geo_done)"; else warn "$(t geo_fail)"; fi
 }
 
 wait_ready(){ # $1 = port
@@ -491,6 +500,7 @@ FLUXGATE_ADMIN_TOKEN=${ADMIN_TOKEN}
 FLUXGATE_CERT_DIR=${DATA_DIR}/certs
 FLUXGATE_DATA_FILE=${DATA_DIR}/fluxgate-data.json
 FLUXGATE_GEOIP_DB=${GEO_FILE}
+FLUXGATE_ASN_DB=${ASN_FILE}
 EOF
   chmod 600 "$ENV_FILE"; chown root:root "$ENV_FILE"
   umask 022

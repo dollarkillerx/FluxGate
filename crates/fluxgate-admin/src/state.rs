@@ -39,6 +39,10 @@ pub struct Config {
     pub retention_days: i64,
     /// Optional GeoIP `.mmdb` path enabling `geo` WAF rules (`None` = disabled).
     pub geoip_path: Option<PathBuf>,
+    /// Optional GeoLite2-ASN `.mmdb` path enabling datacenter blocking (`None` = off).
+    pub asn_path: Option<PathBuf>,
+    /// Per-site byte-traffic totals JSON file (`None` = in-memory only).
+    pub traffic_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -65,6 +69,11 @@ pub struct AppState {
     pub acme_challenges: crate::acme::ChallengeStore,
     /// Per-IP brute-force throttle for the admin login (exponential backoff).
     pub login_throttle: Arc<crate::throttle::LoginThrottle>,
+    /// Per-site byte-traffic aggregator (total / 30d / today), persisted.
+    pub traffic: Arc<crate::traffic::TrafficMeter>,
+    /// Cloudflare published IP ranges (v4 + v6), for the per-site "Cloudflare-only"
+    /// access control. Loaded once at startup.
+    pub cf_ranges: Arc<crate::iprange::CidrList>,
 }
 
 impl AppState {
@@ -116,11 +125,23 @@ impl AppState {
             }
             r
         });
-        let waf = Arc::new(WafEngine::new(geo));
+        let asn = config.asn_path.as_ref().and_then(|p| {
+            let r = WafEngine::load_geoip(p);
+            match &r {
+                Some(_) => tracing::info!("ASN database loaded from {}", p.display()),
+                None => tracing::warn!("ASN database at {} could not be read", p.display()),
+            }
+            r
+        });
+        let waf = Arc::new(WafEngine::new(geo, asn));
         waf.rebuild(&store.waf_rules);
         // Capture buffer paths before `config` is moved into the Arc.
         let log_path = config.log_path.clone();
         let event_path = config.event_path.clone();
+        let traffic = Arc::new(crate::traffic::TrafficMeter::new(
+            config.traffic_path.clone(),
+        ));
+        let cf_ranges = Arc::new(crate::cloudflare::load());
         Self {
             config: Arc::new(config),
             store: Arc::new(Mutex::new(store)),
@@ -135,6 +156,8 @@ impl AppState {
             lb_cursor: Arc::new(Mutex::new(HashMap::new())),
             acme_challenges: Arc::new(Mutex::new(HashMap::new())),
             login_throttle: Arc::new(crate::throttle::LoginThrottle::new()),
+            traffic,
+            cf_ranges,
         }
     }
 
