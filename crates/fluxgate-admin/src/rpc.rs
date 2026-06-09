@@ -8,10 +8,16 @@
 //!   -32700 parse error · -32600 invalid request · -32601 method not found
 //!   -32602 invalid params · -32603 internal error · -32004 not found (custom)
 
-use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json};
+use axum::{
+    extract::{ConnectInfo, State},
+    http::HeaderMap,
+    response::IntoResponse,
+    Json,
+};
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 
 use std::sync::atomic::Ordering;
 
@@ -63,6 +69,7 @@ type RpcResult = Result<Value, RpcError>;
 
 pub async fn handle_rpc(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: String,
 ) -> impl IntoResponse {
@@ -102,8 +109,32 @@ pub async fn handle_rpc(
     tracing::debug!(method = %req.method, "rpc call");
 
     let method = req.method.clone();
+    // Brute-force throttle for the admin login. Keyed on the **socket peer IP**
+    // (not X-Forwarded-For, which a client could spoof to evade the lockout). The
+    // admin console isn't on the WAF/data-plane, so this is its only login guard.
+    // The IP string is resolved only on the login path — every other RPC (dashboard
+    // polling, config reads) skips the allocation entirely.
+    let client_ip = (method == "auth.login").then(|| peer.ip().to_string());
+    if let Some(ip) = &client_ip {
+        let now = Utc::now().timestamp();
+        if let Some(retry) = state.login_throttle.locked_for(ip, now) {
+            tracing::warn!(target: "fluxgate::audit", ip = %ip, "login blocked: too many failed attempts");
+            return Json(error_response(
+                id,
+                RpcError::new(
+                    -32029,
+                    format!("Too many failed login attempts. Try again in {retry}s."),
+                ),
+            ));
+        }
+    }
+
     match dispatch(&state, &method, req.params) {
         Ok(result) => {
+            // A successful login clears that IP's failure streak.
+            if let Some(ip) = &client_ip {
+                state.login_throttle.record_success(ip);
+            }
             // Snapshot to disk after any state-changing call succeeds.
             if is_mutation(&method) {
                 let store = state.store.lock();
@@ -117,6 +148,18 @@ pub async fn handle_rpc(
             Json(success_response(id, result))
         }
         Err(err) => {
+            // Count only genuine credential rejections (-32001) toward the lockout,
+            // not malformed-params or internal errors.
+            if let Some(ip) = &client_ip {
+                if err.code == -32001 {
+                    let locked = state
+                        .login_throttle
+                        .record_failure(ip, Utc::now().timestamp());
+                    if locked > 0 {
+                        tracing::warn!(target: "fluxgate::audit", ip = %ip, secs = locked, "login locked out");
+                    }
+                }
+            }
             tracing::warn!(method = %method, code = err.code, msg = %err.message, "rpc error");
             Json(error_response(id, err))
         }

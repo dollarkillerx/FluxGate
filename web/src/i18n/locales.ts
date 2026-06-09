@@ -437,6 +437,7 @@ const en: Dict = {
   'enum.matchType.method': 'Method',
   'enum.matchType.geo': 'Geo',
   'enum.matchType.rate_limit': 'Rate Limit',
+  'enum.matchType.body': 'Body',
 }
 
 const zh: Dict = {
@@ -844,6 +845,7 @@ const zh: Dict = {
   'enum.matchType.method': '方法',
   'enum.matchType.geo': '地域',
   'enum.matchType.rate_limit': '限速',
+  'enum.matchType.body': '请求体',
 }
 
 const ja: Dict = {

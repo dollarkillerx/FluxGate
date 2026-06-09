@@ -154,7 +154,7 @@ pub fn default_waf_rules() -> Vec<WafRule> {
         hit_count: 0,
     };
     use WafAction::{Challenge, Deny};
-    use WafMatchType::{Geo, Header, Method, Path, RateLimit};
+    use WafMatchType::{Body, Geo, Header, Method, Path, RateLimit};
     // Path rules match the decoded path **and query**, so encoded payloads
     // (%2e%2e, %20) are normalized first. Lower priority = evaluated earlier.
     vec![
@@ -280,6 +280,51 @@ pub fn default_waf_rules() -> Vec<WafRule> {
             17,
             true,
         ),
+        // -- Request-body inspection -------------------------------------------
+        // These match the *decoded body prefix* (form fields, JSON values, etc.),
+        // closing the gap where an attacker simply moves a GET payload into a POST
+        // body. Evaluated by the engine's separate body pass (WafMatchType::Body).
+        mk(
+            "waf-default-body-sqli",
+            "Block SQL injection (body)",
+            "UNION SELECT, boolean (or/and N=N), comments, stacked queries, \
+             sleep/benchmark, INTO OUTFILE, information_schema in the request body.",
+            Body,
+            r"(?i)(\bunion\b\s+(all\s+)?\bselect\b|\b(or|and)\b\s+\d+\s*=\s*\d+|';\s*(--|#)|/\*.*\*/|\b(sleep|benchmark|pg_sleep)\s*\(|\bwaitfor\s+delay\b|\binto\s+(outfile|dumpfile)\b|\bload_file\s*\(|\binformation_schema\b|\bxp_cmdshell\b)",
+            Deny,
+            45,
+            true,
+        ),
+        mk(
+            "waf-default-body-xss",
+            "Block XSS (body)",
+            "Script / event-handler / SVG / iframe injection and XSS sinks in the body.",
+            Body,
+            r"(?i)(<script[\s/>]|</script>|javascript:|vbscript:|\bon(error|load|click|mouseover|focus|toggle|animationstart)\s*=|<svg[\s/>]|<iframe[\s>]|document\.cookie|\balert\s*\(|String\.fromCharCode)",
+            Deny,
+            46,
+            true,
+        ),
+        mk(
+            "waf-default-body-rce",
+            "Block command injection (body)",
+            "Shell metacharacters with common commands, $(...) and `...` substitution in the body.",
+            Body,
+            r"(?i)([;|]\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|powershell|python)\b|&&\s*(cat|ls|id|wget|curl|nc)\b|\$\([^)]*\)|`[^`]*`|/bin/(ba)?sh\b|\bnc\s+-e\b)",
+            Deny,
+            47,
+            true,
+        ),
+        mk(
+            "waf-default-body-php",
+            "Block PHP injection (body)",
+            "Dangerous PHP functions, superglobals and object-injection markers in the body.",
+            Body,
+            r"(?i)(\b(system|exec|shell_exec|passthru|popen|proc_open|assert|eval|create_function|base64_decode|call_user_func)\s*\(|<\?php\b|\$_(get|post|request|cookie|server|files)\b|\bO:\d+:\x22)",
+            Deny,
+            48,
+            true,
+        ),
         mk(
             "waf-default-scanner-ua",
             "Block scanner / attack tools",
@@ -385,7 +430,7 @@ mod tests {
     fn default_rule_patterns_compile() {
         for r in default_waf_rules() {
             match r.match_type {
-                WafMatchType::Path | WafMatchType::Method => {
+                WafMatchType::Path | WafMatchType::Method | WafMatchType::Body => {
                     regex::Regex::new(&r.pattern)
                         .unwrap_or_else(|e| panic!("rule {} bad regex: {e}", r.id));
                 }

@@ -63,6 +63,8 @@ pub struct AppState {
     /// In-flight ACME HTTP-01 challenges (token → key authorization), served by
     /// the proxy at `/.well-known/acme-challenge/<token>`.
     pub acme_challenges: crate::acme::ChallengeStore,
+    /// Per-IP brute-force throttle for the admin login (exponential backoff).
+    pub login_throttle: Arc<crate::throttle::LoginThrottle>,
 }
 
 impl AppState {
@@ -132,6 +134,7 @@ impl AppState {
             proxy_client: Arc::new(crate::proxy::build_client()),
             lb_cursor: Arc::new(Mutex::new(HashMap::new())),
             acme_challenges: Arc::new(Mutex::new(HashMap::new())),
+            login_throttle: Arc::new(crate::throttle::LoginThrottle::new()),
         }
     }
 

@@ -21,7 +21,7 @@ import { wafActionTone } from '@/lib/status'
 
 const col = createColumnHelper<WafRule>()
 
-const MATCH_TYPES: WafMatchType[] = ['ip', 'path', 'header', 'method', 'geo', 'rate_limit']
+const MATCH_TYPES: WafMatchType[] = ['ip', 'path', 'header', 'method', 'geo', 'rate_limit', 'body']
 const ACTIONS: WafAction[] = ['allow', 'deny', 'challenge']
 
 interface WafForm {

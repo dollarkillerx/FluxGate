@@ -32,6 +32,7 @@ mod proxy;
 mod rpc;
 mod serve;
 mod state;
+mod throttle;
 mod tls;
 mod waf;
 mod waf_packs;

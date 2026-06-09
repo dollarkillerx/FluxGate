@@ -61,7 +61,7 @@ export interface Upstream {
 }
 
 export type WafAction = 'allow' | 'deny' | 'challenge'
-export type WafMatchType = 'ip' | 'path' | 'header' | 'method' | 'geo' | 'rate_limit'
+export type WafMatchType = 'ip' | 'path' | 'header' | 'method' | 'geo' | 'rate_limit' | 'body'
 
 export interface WafRule {
   id: string

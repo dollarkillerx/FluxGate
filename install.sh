@@ -24,7 +24,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DOWNLOAD_URL="https://github.com/dollarkillerx/FluxGate/releases/download/v0.1.2/fluxgate-admin-0.1.0-x86_64-linux-musl.tar.gz"
+DOWNLOAD_URL="https://github.com/dollarkillerx/FluxGate/releases/download/v0.1.3/fluxgate-admin-0.1.0-x86_64-linux-musl.tar.gz"
 GEO_URL="https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb"
 INSTALL_BIN="/usr/local/bin/fluxgate-admin"
 DATA_DIR="/var/lib/fluxgate"

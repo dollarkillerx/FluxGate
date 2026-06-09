@@ -145,6 +145,10 @@ pub enum WafMatchType {
     Method,
     Geo,
     RateLimit,
+    /// Match a regex against the (decoded) **request body** prefix. Inspected on
+    /// the data plane only — the proxy reads a bounded body prefix on demand and
+    /// evaluates these rules separately (see `WafEngine::evaluate_body`).
+    Body,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

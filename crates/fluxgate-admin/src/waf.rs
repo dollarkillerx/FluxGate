@@ -125,6 +125,10 @@ enum Matcher {
         limit: u32,
     },
     Geo(GeoMatcher),
+    /// Matches against the request body — evaluated by [`WafEngine::evaluate_body`]
+    /// (the body is read on the data plane), so it is *inert* during the normal
+    /// request-line/header pass in [`WafEngine::evaluate`].
+    Body(Regex),
     Never,
 }
 
@@ -165,6 +169,9 @@ struct CompiledRule {
 #[derive(Default)]
 struct CompiledRuleSet {
     rules: Vec<CompiledRule>,
+    /// Whether any enabled rule inspects the body. Lets the data plane skip the
+    /// body-prefix read entirely when no body rules are active (zero cost).
+    has_body: bool,
 }
 
 fn compile_rule(r: &WafRule) -> CompiledRule {
@@ -208,6 +215,9 @@ fn compile_rule(r: &WafRule) -> CompiledRule {
         },
         // Real GeoIP matching when a database is loaded (see WafEngine.geo).
         WafMatchType::Geo => Matcher::Geo(parse_geo(&r.pattern)),
+        WafMatchType::Body => Regex::new(&r.pattern)
+            .map(Matcher::Body)
+            .unwrap_or(Matcher::Never),
     };
     CompiledRule {
         id: r.id.clone(),
@@ -256,9 +266,9 @@ impl WafEngine {
     pub fn rebuild(&self, rules: &[WafRule]) {
         let mut enabled: Vec<&WafRule> = rules.iter().filter(|r| r.enabled).collect();
         enabled.sort_by_key(|r| r.priority);
-        let compiled = CompiledRuleSet {
-            rules: enabled.into_iter().map(compile_rule).collect(),
-        };
+        let rules: Vec<CompiledRule> = enabled.into_iter().map(compile_rule).collect();
+        let has_body = rules.iter().any(|r| matches!(r.matcher, Matcher::Body(_)));
+        let compiled = CompiledRuleSet { rules, has_body };
         *self.compiled.write() = Arc::new(compiled);
     }
 
@@ -286,6 +296,40 @@ impl WafEngine {
         }
     }
 
+    /// Evaluate the request **body** against `Body` rules only (first match wins,
+    /// ascending priority). Returns `Some(decision)` on the first matching body
+    /// rule, or `None` if none match (→ caller keeps the request).
+    ///
+    /// Kept separate from [`evaluate`] for two reasons: the body is read on the
+    /// data plane only when needed (so the request-line pass can short-circuit a
+    /// deny without ever touching the body), and re-running the full rule set
+    /// would double-count the stateful rate-limit counters. `raw` is the decoded
+    /// body prefix; it is normalized once here (percent / `+` / `\`).
+    pub fn evaluate_body(&self, raw: &str) -> Option<WafDecision> {
+        let set = self.compiled.read().clone(); // cheap Arc clone, lock released
+        let norm = normalize_body(raw);
+        for rule in &set.rules {
+            if let Matcher::Body(re) = &rule.matcher {
+                if re.is_match(&norm) {
+                    *self.hits.lock().entry(rule.id.clone()).or_default() += 1;
+                    return Some(WafDecision {
+                        action: rule.action,
+                        matched_rule_id: Some(rule.id.clone()),
+                        matched_rule_name: Some(rule.name.clone()),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether any enabled rule inspects the request body. The data plane checks
+    /// this before reading a body prefix, so body inspection is truly zero-cost
+    /// when no body rules are active.
+    pub fn has_body_rules(&self) -> bool {
+        self.compiled.read().has_body
+    }
+
     /// Snapshot of per-rule hit counts, overlaid onto rules when listing them.
     pub fn hits(&self) -> HashMap<String, u64> {
         self.hits.lock().clone()
@@ -304,6 +348,9 @@ impl WafEngine {
                 self.rate_limited(id, prefix, *limit, ctx.client_ip, norm_path, now_sec)
             }
             Matcher::Geo(gm) => self.geo_matches(gm, ctx.client_ip),
+            // Body rules need the request body, which isn't part of the request-line
+            // pass; they are evaluated by `evaluate_body` instead. Inert here.
+            Matcher::Body(_) => false,
             Matcher::Never => false,
         }
     }
@@ -372,6 +419,37 @@ fn normalize_path(raw: &str) -> Cow<'_, str> {
         return Cow::Borrowed(raw);
     }
     let mut cur = raw.to_string();
+    for _ in 0..2 {
+        let decoded = percent_decode(&cur);
+        if decoded == cur {
+            break;
+        }
+        cur = decoded;
+    }
+    if cur.contains('\\') {
+        cur = cur.replace('\\', "/");
+    }
+    Cow::Owned(cur)
+}
+
+/// Normalize a request-body prefix before matching. Like [`normalize_path`] but
+/// also folds `+` → space (the `application/x-www-form-urlencoded` convention),
+/// so `id=1+or+1%3D1` matches the same rule as its decoded form.
+///
+/// This is **detection-only**: the bytes forwarded upstream are the original,
+/// unmodified body (see `PrefixBody` in `proxy.rs`). Over-decoding therefore can
+/// only ever cause a false positive — never corrupt a proxied request — which is
+/// the safe direction for a WAF.
+fn normalize_body(raw: &str) -> Cow<'_, str> {
+    // Fast path: nothing to decode — borrow, no allocation.
+    if !raw.contains('%') && !raw.contains('+') && !raw.contains('\\') {
+        return Cow::Borrowed(raw);
+    }
+    let mut cur = if raw.contains('+') {
+        raw.replace('+', " ")
+    } else {
+        raw.to_string()
+    };
     for _ in 0..2 {
         let decoded = percent_decode(&cur);
         if decoded == cur {
@@ -560,6 +638,42 @@ mod tests {
         );
     }
 
+    /// Microbenchmark for the **body** pass over the real default body ruleset.
+    ///   cargo test --release -p fluxgate-admin -- --ignored --nocapture bench_evaluate_body
+    #[test]
+    #[ignore]
+    fn bench_evaluate_body() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let engine = WafEngine::new(None);
+        engine.rebuild(&crate::persist::default_waf_rules());
+        let iters = 1_000_000u32;
+
+        // Benign form body = worst case (all 4 body rules run, none matches).
+        let benign = "username=alice&password=hunter2&remember=true&token=9f8c2a1b4d6e0011";
+        for _ in 0..50_000 {
+            black_box(engine.evaluate_body(black_box(benign)));
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            black_box(engine.evaluate_body(black_box(benign)));
+        }
+        let ns = t.elapsed().as_nanos() as f64 / iters as f64;
+
+        // Malicious form body = early match; the '+' forces a normalize allocation.
+        let mal = "q=1+union+select+username,password+from+users--";
+        let t2 = Instant::now();
+        for _ in 0..iters {
+            black_box(engine.evaluate_body(black_box(mal)));
+        }
+        let ns2 = t2.elapsed().as_nanos() as f64 / iters as f64;
+
+        println!(
+            "\nWAF evaluate_body (4 body rules, single core):\n  benign  (all rules run): {:>6.0} ns/req  (~{:.1}M req/s)\n  malicious (early match): {:>6.0} ns/req  (~{:.1}M req/s)\n",
+            ns, 1e3 / ns, ns2, 1e3 / ns2
+        );
+    }
+
     #[test]
     fn rate_limit_trips_after_threshold() {
         let h = HashMap::new();
@@ -636,6 +750,38 @@ mod tests {
         let engine = engine_with(&[r]);
         let d = engine.evaluate(WafAction::Allow, &ctx("1.1.1.1", "GET", "/x", &h), 0);
         assert_eq!(d.action, WafAction::Allow);
+    }
+
+    #[test]
+    fn body_rule_matches_decoded_body() {
+        let engine = engine_with(&[rule(
+            WafMatchType::Body,
+            r"(?i)union\s+select",
+            WafAction::Deny,
+        )]);
+        // Form-urlencoded SQLi: '+' → space, '%20'/'%27' decoded.
+        let d = engine.evaluate_body("q=1+union+select+1").unwrap();
+        assert_eq!(d.action, WafAction::Deny);
+        let d2 = engine.evaluate_body("name=alice&age=30");
+        assert!(d2.is_none());
+    }
+
+    #[test]
+    fn body_rule_inert_in_request_line_pass() {
+        // A Body rule must never fire during the normal (no-body) evaluate pass,
+        // otherwise it would block on the request line and never see the body.
+        let h = HashMap::new();
+        let engine = engine_with(&[rule(WafMatchType::Body, r"(?i)evil", WafAction::Deny)]);
+        let d = engine.evaluate(WafAction::Allow, &ctx("1.1.1.1", "POST", "/evil", &h), 0);
+        assert_eq!(d.action, WafAction::Allow);
+    }
+
+    #[test]
+    fn body_normalization_catches_encoded_payload() {
+        let engine = engine_with(&[rule(WafMatchType::Body, r"<script", WafAction::Deny)]);
+        // Percent-encoded `<script` in the body must still match.
+        let d = engine.evaluate_body("c=%3Cscript%3Ealert(1)").unwrap();
+        assert_eq!(d.action, WafAction::Deny);
     }
 
     #[test]
