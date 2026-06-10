@@ -25,6 +25,8 @@ export interface Site {
   browser_only?: boolean
   /** Serve a disallow-all robots.txt instead of proxying it. */
   rewrite_robots?: boolean
+  /** Per-path 301/302 redirect rules, evaluated before routing to an upstream. */
+  redirects?: RedirectRule[]
   /** Deny clients from these ISO-3166-1 alpha-2 countries (GeoIP). */
   blocked_countries?: string[]
   /** Deny clients on known datacenter/cloud/hosting ASNs. */
@@ -34,6 +36,15 @@ export interface Site {
   enabled: boolean
   created_at: string
   updated_at: string
+}
+
+/** A per-site URL redirect. `path` matches exactly, or as a prefix when it ends
+ *  with `*` (e.g. `/old*`). `target` is an absolute URL or site-relative path. */
+export interface RedirectRule {
+  path: string
+  target: string
+  /** 301 (permanent) or 302 (temporary). */
+  status: number
 }
 
 /** A route maps a path (under its parent site's host) to an upstream. */

@@ -10,10 +10,10 @@ interface ModalProps {
   description?: ReactNode
   children: ReactNode
   footer?: ReactNode
-  size?: 'sm' | 'md' | 'lg'
+  size?: 'sm' | 'md' | 'lg' | 'xl'
 }
 
-const sizes = { sm: 'max-w-md', md: 'max-w-lg', lg: 'max-w-2xl' }
+const sizes = { sm: 'max-w-md', md: 'max-w-lg', lg: 'max-w-2xl', xl: 'max-w-3xl' }
 
 export function Modal({ open, onClose, title, description, children, footer, size = 'md' }: ModalProps) {
   useEffect(() => {

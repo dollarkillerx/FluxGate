@@ -247,6 +247,28 @@ async fn proxy_handler(
                 .map(IntoResponse::into_response)
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
+        // A site redirect rule matched → answer with its 301/302 + Location.
+        RouteOutcome::CustomRedirect { location, status } => {
+            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::FOUND);
+            log_request(
+                &state,
+                &client_ip,
+                &method,
+                &host,
+                &path,
+                code.as_u16(),
+                started,
+                "-",
+                WafAction::Allow,
+                device,
+            );
+            return Response::builder()
+                .status(code)
+                .header(axum::http::header::LOCATION, location)
+                .body(Body::empty())
+                .map(IntoResponse::into_response)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
         RouteOutcome::Found(t) => t,
         RouteOutcome::NoRoute => {
             log_request(
@@ -890,9 +912,21 @@ fn forward_request_header(name: &HeaderName, is_ws: bool) -> bool {
 enum RouteOutcome {
     /// Plaintext request to a TLS-enabled site with HTTP→HTTPS redirect on.
     Redirect,
+    /// A site redirect rule matched: answer with `status` (301/302) → `location`.
+    CustomRedirect { location: String, status: u16 },
     Found(Target),
     NoRoute,
     NoHealthyUpstream,
+}
+
+/// Whether a redirect rule's configured `path` matches the request `path`.
+/// A trailing `*` makes it a prefix match (`/old*` ⊇ `/old`, `/old/x`);
+/// otherwise the match is exact.
+fn redirect_matches(rule_path: &str, path: &str) -> bool {
+    match rule_path.strip_suffix('*') {
+        Some(prefix) => path.starts_with(prefix),
+        None => path == rule_path,
+    }
 }
 
 /// Everything `pick_target` resolves for a forwardable request — the upstream
@@ -936,6 +970,18 @@ fn pick_target(
     // Plaintext request to a TLS-enabled, redirect-on site → tell caller to 308.
     if !secure && site.tls_enabled && site.https_redirect {
         return RouteOutcome::Redirect;
+    }
+    // Site redirect rules (301/302) — checked before route lookup so a rule can
+    // target a path with no upstream. First match wins, in configured order.
+    if let Some(rule) = site
+        .redirects
+        .iter()
+        .find(|r| redirect_matches(&r.path, path))
+    {
+        return RouteOutcome::CustomRedirect {
+            location: rule.target.clone(),
+            status: rule.status,
+        };
     }
     let route = store
         .routes
@@ -1518,6 +1564,23 @@ mod tests {
             .map(|_| select_node(&up, "x", &mut cur).unwrap())
             .collect();
         assert_eq!(picks.iter().filter(|p| *p == "a:1").count(), 3);
+    }
+
+    #[test]
+    fn redirect_rule_matching() {
+        // Exact match only when there's no trailing star.
+        assert!(redirect_matches("/old", "/old"));
+        assert!(!redirect_matches("/old", "/old/"));
+        assert!(!redirect_matches("/old", "/older"));
+        // Trailing `*` is a prefix match.
+        assert!(redirect_matches("/old*", "/old"));
+        assert!(redirect_matches("/old*", "/old/page"));
+        assert!(redirect_matches("/old*", "/older")); // prefix, not path-segment
+        assert!(!redirect_matches("/old*", "/new"));
+        // Bare `*` (or `/...*`) redirects everything under the prefix.
+        assert!(redirect_matches("*", "/anything"));
+        assert!(redirect_matches("/*", "/anything"));
+        assert!(!redirect_matches("/*", "anything"));
     }
 
     #[test]

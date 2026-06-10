@@ -12,6 +12,7 @@ through a clean web console (English / 中文 / 日本語).
 ## Features
 
 - 🔁 **Reverse proxy** — sites & path routes, load balancing, WebSocket & streaming
+- ↪️ **Redirects** — per-site **301 / 302** rules: match a path **exactly** or by **prefix** (`/old*`) and send visitors to a full URL or a `/path`, answered at the edge before proxying. Plus a one-toggle **HTTP→HTTPS** (308) redirect per site
 - 🛡️ **WAF** — OWASP **Core Rule Set (CRS) enabled by default** (SQLi, XSS, RCE, LFI/RFI, scanner detection…), inspecting the **request line, headers _and_ body**; custom IP (IPv4 **+ IPv6**) / path / method / geo / rate-limit / **body** rules; a managed human-verification challenge; and per-IP **brute-force lockout** on the admin login
 - 🌍 **Per-site access control** — block by **country** (GeoIP), block **datacenter / cloud IPs** (ASN ≈ "residential only"), accept **only Cloudflare** traffic, or **browser-only** (User-Agent allow-list). Bound to the site and enforced **even when the WAF is off**; Cloudflare-aware (`CF-Connecting-IP`)
 - 🚫 **IP allow / block lists + auto-ban** — manual allow (full-trust) & block lists, plus optional **auto-ban**: block an IP after _N_ WAF denies in 24h, for a set duration or permanently. Dual-stack (IPv4/IPv6), with one-click unban
@@ -39,7 +40,10 @@ Re-run the same command later to get a **stop / restart / update** menu
 > on first visit. ACME issuance needs your domain to resolve to the host and
 > port 80 reachable from the internet.
 >
-> Each site has **Advanced options** — upload cap (default 500 MB), upstream
+> Each site supports **301 / 302 redirect rules** (match a path exactly or by
+> `/old*` prefix → a full URL or `/path`), evaluated at the edge before routing.
+>
+> Each site also has **Advanced options** — upload cap (default 500 MB), upstream
 > timeout (120 s), crawler blocking, browser-only, and **IP access control**
 > (block countries, block datacenter/cloud IPs, or Cloudflare-only).
 >

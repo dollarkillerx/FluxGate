@@ -45,6 +45,10 @@ pub struct Site {
     /// Serve a disallow-all `robots.txt` instead of proxying it to the origin.
     #[serde(default)]
     pub rewrite_robots: bool,
+    /// Per-path 301/302 redirect rules, evaluated before routing to an upstream.
+    /// First match wins (in list order); see `RedirectRule`.
+    #[serde(default)]
+    pub redirects: Vec<RedirectRule>,
     /// Deny clients whose GeoIP country is in this list (ISO-3166-1 alpha-2 codes).
     /// Empty = no geo restriction. Uses the real client IP (CF-Connecting-IP aware).
     #[serde(default)]
@@ -60,6 +64,20 @@ pub struct Site {
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// A per-site URL redirect: a request whose path matches `path` is answered with
+/// `status` (301 permanent or 302 temporary) and a `Location` of `target`,
+/// instead of being proxied to an upstream. `path` matches the request path
+/// **exactly**, or as a **prefix** when it ends with `*` (e.g. `/old*` matches
+/// `/old`, `/old/page`…). `target` may be an absolute URL (`https://host/new`)
+/// or a site-relative path (`/new`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedirectRule {
+    pub path: String,
+    pub target: String,
+    /// HTTP redirect status: 301 (permanent) or 302 (temporary).
+    pub status: u16,
 }
 
 fn default_max_body_mb() -> u64 {

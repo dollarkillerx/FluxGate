@@ -413,6 +413,7 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 block_crawler_ua: input.block_crawler_ua.unwrap_or(false),
                 browser_only: input.browser_only.unwrap_or(false),
                 rewrite_robots: input.rewrite_robots.unwrap_or(false),
+                redirects: normalize_redirects(input.redirects),
                 blocked_countries: normalize_countries(input.blocked_countries),
                 block_datacenter: input.block_datacenter.unwrap_or(false),
                 cloudflare_only: input.cloudflare_only.unwrap_or(false),
@@ -464,6 +465,9 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             }
             if let Some(v) = input.rewrite_robots {
                 s.rewrite_robots = v;
+            }
+            if let Some(v) = input.redirects {
+                s.redirects = normalize_redirects(Some(v));
             }
             if let Some(v) = input.blocked_countries {
                 s.blocked_countries = normalize_countries(Some(v));
@@ -1021,6 +1025,29 @@ fn normalize_countries(input: Option<Vec<String>>) -> Vec<String> {
     out
 }
 
+/// Sanitize site redirect rules: trim path/target, drop entries missing either,
+/// and clamp `status` to a supported redirect code (301/302/307/308; default 301).
+fn normalize_redirects(input: Option<Vec<RedirectRule>>) -> Vec<RedirectRule> {
+    let mut out: Vec<RedirectRule> = Vec::new();
+    for r in input.unwrap_or_default() {
+        let path = r.path.trim().to_string();
+        let target = r.target.trim().to_string();
+        if path.is_empty() || target.is_empty() {
+            continue;
+        }
+        let status = match r.status {
+            301 | 302 | 307 | 308 => r.status,
+            _ => 301,
+        };
+        out.push(RedirectRule {
+            path,
+            target,
+            status,
+        });
+    }
+    out
+}
+
 /// Add a validated IP/CIDR entry to an allow/block list (dedup by value).
 fn add_ip_entry(list: &mut Vec<IpListEntry>, params: Value) -> RpcResult {
     let p: IpEntryInput = parse(params)?;
@@ -1360,6 +1387,7 @@ struct SiteInput {
     block_crawler_ua: Option<bool>,
     browser_only: Option<bool>,
     rewrite_robots: Option<bool>,
+    redirects: Option<Vec<RedirectRule>>,
     blocked_countries: Option<Vec<String>>,
     block_datacenter: Option<bool>,
     cloudflare_only: Option<bool>,

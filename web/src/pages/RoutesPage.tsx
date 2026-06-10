@@ -5,7 +5,7 @@ import { useRpc } from '@/hooks/useRpc'
 import { rpc } from '@/api/rpc'
 import { useToast } from '@/context/ToastContext'
 import { useI18n } from '@/i18n/I18nContext'
-import type { Route, Site, Upstream, TlsCertificate } from '@/types'
+import type { RedirectRule, Route, Site, Upstream, TlsCertificate } from '@/types'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Card, CardBody } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
@@ -34,12 +34,13 @@ interface SiteForm {
   block_crawler_ua: boolean
   browser_only: boolean
   rewrite_robots: boolean
+  redirects: RedirectRule[]
   blocked_countries: string[]
   block_datacenter: boolean
   cloudflare_only: boolean
   enabled: boolean
 }
-const emptySite: SiteForm = { name: '', host: '', tls_enabled: true, cert_id: '', https_redirect: true, waf_enabled: true, max_body_mb: 500, upstream_timeout_secs: 120, block_crawler_ua: false, browser_only: false, rewrite_robots: false, blocked_countries: [], block_datacenter: false, cloudflare_only: false, enabled: true }
+const emptySite: SiteForm = { name: '', host: '', tls_enabled: true, cert_id: '', https_redirect: true, waf_enabled: true, max_body_mb: 500, upstream_timeout_secs: 120, block_crawler_ua: false, browser_only: false, rewrite_robots: false, redirects: [], blocked_countries: [], block_datacenter: false, cloudflare_only: false, enabled: true }
 
 /** A certificate covers `host` if its domain matches exactly (case-insensitive)
  *  or via a single-label wildcard (`*.example.com` ⊇ `a.example.com`). */
@@ -228,6 +229,7 @@ export function RoutesPage() {
                             <Badge tone="neutral">{t('routes.enableTls')}: {t('common.off')}</Badge>
                           )}
                           {site.tls_enabled && site.https_redirect && <Badge tone="info">HTTP→HTTPS</Badge>}
+                          {(site.redirects?.length ?? 0) > 0 && <Badge tone="info">{t('sites.redirectBadge', { n: site.redirects!.length })}</Badge>}
                           {site.waf_enabled && <Badge tone="warning"><ShieldCheck size={10} className="mr-0.5 inline" />WAF</Badge>}
                         </div>
                       </button>
@@ -236,7 +238,7 @@ export function RoutesPage() {
                         <Button variant="ghost" size="sm" icon={<Plus size={14} />} onClick={() => { setExpanded((e) => ({ ...e, [site.id]: true })); setRouteForm({ site_id: site.id, path: '/', upstream: upstreams.data?.[0]?.name ?? '', waf_enabled: site.waf_enabled, enabled: true }) }}>
                           {t('sites.addPath')}
                         </Button>
-                        <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => { setAdvanced(false); setSiteForm({ id: site.id, name: site.name, host: site.host, tls_enabled: site.tls_enabled, cert_id: site.cert_id ?? '', https_redirect: site.https_redirect ?? false, waf_enabled: site.waf_enabled, max_body_mb: site.max_body_mb ?? 500, upstream_timeout_secs: site.upstream_timeout_secs ?? 120, block_crawler_ua: site.block_crawler_ua ?? false, browser_only: site.browser_only ?? false, rewrite_robots: site.rewrite_robots ?? false, blocked_countries: site.blocked_countries ?? [], block_datacenter: site.block_datacenter ?? false, cloudflare_only: site.cloudflare_only ?? false, enabled: site.enabled }) }} aria-label={t('common.edit')} />
+                        <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => { setAdvanced(false); setSiteForm({ id: site.id, name: site.name, host: site.host, tls_enabled: site.tls_enabled, cert_id: site.cert_id ?? '', https_redirect: site.https_redirect ?? false, waf_enabled: site.waf_enabled, max_body_mb: site.max_body_mb ?? 500, upstream_timeout_secs: site.upstream_timeout_secs ?? 120, block_crawler_ua: site.block_crawler_ua ?? false, browser_only: site.browser_only ?? false, rewrite_robots: site.rewrite_robots ?? false, redirects: site.redirects ?? [], blocked_countries: site.blocked_countries ?? [], block_datacenter: site.block_datacenter ?? false, cloudflare_only: site.cloudflare_only ?? false, enabled: site.enabled }) }} aria-label={t('common.edit')} />
                         <Button variant="ghost" size="sm" icon={<Trash2 size={14} className="text-red-500" />} onClick={() => setSiteToDelete(site)} aria-label={t('common.delete')} />
                       </div>
                     </div>
@@ -289,6 +291,7 @@ export function RoutesPage() {
 
       {/* Site create / edit modal */}
       <Modal
+        size="xl"
         open={!!siteForm}
         onClose={() => setSiteForm(null)}
         title={siteForm?.id ? t('sites.editTitle') : t('sites.newTitle')}
@@ -334,6 +337,64 @@ export function RoutesPage() {
                 </label>
               </>
             )}
+
+            {/* Redirect rules (301 / 302) */}
+            <div className="border-t border-slate-200 pt-3 dark:border-slate-700">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-slate-700 dark:text-slate-200">{t('sites.redirects')}</p>
+                  <p className="mt-0.5 text-xs text-slate-400">{t('sites.redirectsHint')}</p>
+                </div>
+                <Button variant="secondary" size="sm" className="shrink-0 whitespace-nowrap" icon={<Plus size={14} />} onClick={() => setSiteForm({ ...siteForm, redirects: [...siteForm.redirects, { path: '', target: '', status: 301 }] })}>
+                  {t('sites.addRedirect')}
+                </Button>
+              </div>
+              {siteForm.redirects.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  <div className="flex items-center gap-2 px-0.5 text-[11px] uppercase tracking-wide text-slate-400">
+                    <span className="min-w-0 flex-1">{t('sites.redirectFrom')}</span>
+                    <span className="w-3.5 shrink-0" />
+                    <span className="min-w-0 flex-1">{t('sites.redirectTo')}</span>
+                    <span className="w-[4.5rem] shrink-0">{t('sites.redirectStatus')}</span>
+                    <span className="w-9 shrink-0" />
+                  </div>
+                  {siteForm.redirects.map((rule, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <div className="min-w-0 flex-1">
+                        <Input
+                          value={rule.path}
+                          onChange={(e) => setSiteForm({ ...siteForm, redirects: siteForm.redirects.map((r, j) => (j === i ? { ...r, path: e.target.value } : r)) })}
+                          placeholder="/old-path"
+                          className="font-mono text-xs"
+                          aria-label={t('sites.redirectFrom')}
+                        />
+                      </div>
+                      <ChevronRight size={14} className="shrink-0 text-slate-400" />
+                      <div className="min-w-0 flex-1">
+                        <Input
+                          value={rule.target}
+                          onChange={(e) => setSiteForm({ ...siteForm, redirects: siteForm.redirects.map((r, j) => (j === i ? { ...r, target: e.target.value } : r)) })}
+                          placeholder="https://example.com/new"
+                          className="font-mono text-xs"
+                          aria-label={t('sites.redirectTo')}
+                        />
+                      </div>
+                      <div className="w-[4.5rem] shrink-0">
+                        <Select
+                          value={String(rule.status)}
+                          onChange={(e) => setSiteForm({ ...siteForm, redirects: siteForm.redirects.map((r, j) => (j === i ? { ...r, status: Number(e.target.value) } : r)) })}
+                          aria-label={t('sites.redirectStatus')}
+                        >
+                          <option value="301">301</option>
+                          <option value="302">302</option>
+                        </Select>
+                      </div>
+                      <Button variant="ghost" size="sm" icon={<Trash2 size={14} className="text-red-500" />} onClick={() => setSiteForm({ ...siteForm, redirects: siteForm.redirects.filter((_, j) => j !== i) })} aria-label={t('common.delete')} />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
 
             {/* Advanced options (collapsible) */}
             <div className="border-t border-slate-200 pt-3 dark:border-slate-700">
