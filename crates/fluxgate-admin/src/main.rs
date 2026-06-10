@@ -22,6 +22,7 @@
 //! Ports 80/443 are privileged — run with sudo, or point the proxy at high
 //! ports (e.g. `FLUXGATE_PROXY_ADDR=0.0.0.0:8080 FLUXGATE_PROXY_TLS_ADDR=0.0.0.0:8443`).
 
+mod access;
 mod acme;
 mod assets;
 mod auth;
@@ -80,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         geoip_path: resolve_geoip_path(),
         asn_path: resolve_asn_path(),
         traffic_path: resolve_opt_path("FLUXGATE_TRAFFIC_FILE", "fluxgate-traffic.json"),
+        bans_path: resolve_opt_path("FLUXGATE_BANS_FILE", "fluxgate-bans.json"),
     };
     if let Err(e) = std::fs::create_dir_all(&config.cert_dir) {
         tracing::warn!(
@@ -257,12 +259,17 @@ fn spawn_background_tasks(state: AppState) {
     // per-site total / 30d / today figures survive restarts. The in-memory meter
     // is updated live by the data plane; this just snapshots it to disk.
     let traffic = state.traffic.clone();
+    let access = state.access.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(30));
         loop {
             ticker.tick().await;
-            let traffic = traffic.clone();
-            let _ = tokio::task::spawn_blocking(move || traffic.flush()).await;
+            let (traffic, access) = (traffic.clone(), access.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                traffic.flush();
+                access.flush(Utc::now().timestamp());
+            })
+            .await;
         }
     });
 }

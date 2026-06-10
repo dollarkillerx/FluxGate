@@ -122,13 +122,26 @@ pub fn empty_store() -> Store {
         sites: Vec::new(),
         routes: Vec::new(),
         upstreams: Vec::new(),
-        // Ship a sensible baseline ruleset out of the box.
-        waf_rules: default_waf_rules(),
+        // Ship the full built-in ruleset out of the box (baseline + OWASP CRS).
+        waf_rules: seed_waf_rules(),
         certs: Vec::new(),
         settings: default_settings(),
+        ip_whitelist: Vec::new(),
+        ip_blacklist: Vec::new(),
         // Populated by AppState::new on first run (bootstrapped from env).
         auth: AuthCreds::default(),
     }
+}
+
+/// The complete set of built-in WAF rules shipped enabled by default: the
+/// baseline rules **plus** the OWASP CRS pack. Used to seed fresh installs and,
+/// via the id-based merge in `AppState::new`, to add any missing built-ins to
+/// existing installs on restart — so CRS is on by default without an explicit
+/// import.
+pub fn seed_waf_rules() -> Vec<WafRule> {
+    let mut rules = default_waf_rules();
+    rules.extend(crate::waf_packs::pack_rules("owasp-crs").unwrap_or_default());
+    rules
 }
 
 /// Built-in WAF rules seeded on first run. All are real (evaluated by the WAF
@@ -384,6 +397,9 @@ fn default_settings() -> Settings {
         worker_threads: num_cpus::get() as u32,
         max_connections: 65536,
         request_timeout_secs: 30,
+        auto_ban_enabled: false,
+        auto_ban_threshold: 20,
+        auto_ban_duration_secs: 5 * 3600,
     }
 }
 
@@ -462,5 +478,26 @@ mod tests {
         assert!(!s.waf_rules.is_empty());
         assert_eq!(s.settings.default_waf_action, WafAction::Allow);
         assert!(s.auth.password_hash.is_empty()); // bootstrapped later
+    }
+
+    #[test]
+    fn seed_rules_include_crs_with_unique_ids() {
+        let rules = seed_waf_rules();
+        // CRS is now part of the default seed (enabled out of the box).
+        assert!(rules.iter().any(|r| r.id.starts_with("crs-")));
+        assert!(
+            rules
+                .iter()
+                .filter(|r| r.id.starts_with("crs-"))
+                .all(|r| r.enabled),
+            "shipped CRS rules must be enabled"
+        );
+        // The id-based merge in AppState::new relies on globally-unique ids.
+        let ids: std::collections::HashSet<_> = rules.iter().map(|r| &r.id).collect();
+        assert_eq!(
+            ids.len(),
+            rules.len(),
+            "baseline + CRS rule ids must not collide"
+        );
     }
 }

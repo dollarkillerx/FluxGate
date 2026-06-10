@@ -144,6 +144,12 @@ pub async fn handle_rpc(
                 if method.starts_with("waf.rule") {
                     state.waf.rebuild(&store.waf_rules);
                 }
+                // Recompile the IP allow/block lists when they changed.
+                if method.starts_with("ip.") {
+                    state
+                        .access
+                        .rebuild(&store.ip_whitelist, &store.ip_blacklist);
+                }
             }
             Json(success_response(id, result))
         }
@@ -197,6 +203,8 @@ fn is_mutation(method: &str) -> bool {
         )
     ) || method == "settings.update"
         || method == "auth.change_password"
+        // IP allow/block list mutations (the `.add` / `.remove` / unban suffixes).
+        || (method.starts_with("ip.") && method != "ip.list")
 }
 
 fn success_response(id: Value, result: Value) -> Value {
@@ -334,6 +342,42 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             );
             ok(stats.devices)
         }
+        "dashboard.attacks" => {
+            // Risk board: 24h WAF-block timeline + top attacker UAs + attack-source
+            // countries, from the recorded WAF events.
+            drop(store);
+            let events = state.waf_events.lock();
+            ok(collector::attack_overview(
+                &events,
+                Utc::now(),
+                |ip| state.waf.country_of(ip),
+                10,
+                12,
+            ))
+        }
+
+        // ---- IP access control (allow / block lists + auto-ban) ----
+        "ip.list" => ok(json!({
+            "whitelist": &store.ip_whitelist,
+            "blacklist": &store.ip_blacklist,
+            "bans": state.access.list_bans(Utc::now().timestamp()),
+            "auto_ban_enabled": store.settings.auto_ban_enabled,
+            "auto_ban_threshold": store.settings.auto_ban_threshold,
+            "auto_ban_duration_secs": store.settings.auto_ban_duration_secs,
+        })),
+        "ip.whitelist.add" => add_ip_entry(&mut store.ip_whitelist, params),
+        "ip.whitelist.remove" => remove_ip_entry(&mut store.ip_whitelist, params),
+        "ip.blacklist.add" => add_ip_entry(&mut store.ip_blacklist, params),
+        "ip.blacklist.remove" => remove_ip_entry(&mut store.ip_blacklist, params),
+        "ip.ban.remove" => {
+            let p: IpBanInput = parse(params)?;
+            let removed = state.access.unban(&p.ip);
+            // Persist immediately so the unban sticks even if we restart before the
+            // periodic flush (otherwise the ban would resurrect from disk).
+            state.access.flush(Utc::now().timestamp());
+            audit("ip.ban.remove", &p.ip);
+            ok(json!({ "removed": removed }))
+        }
 
         // ---- Sites (hosts) ----
         "site.list" => ok(&store.sites),
@@ -367,6 +411,7 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 max_body_mb: input.max_body_mb.unwrap_or(500),
                 upstream_timeout_secs: input.upstream_timeout_secs.unwrap_or(120),
                 block_crawler_ua: input.block_crawler_ua.unwrap_or(false),
+                browser_only: input.browser_only.unwrap_or(false),
                 rewrite_robots: input.rewrite_robots.unwrap_or(false),
                 blocked_countries: normalize_countries(input.blocked_countries),
                 block_datacenter: input.block_datacenter.unwrap_or(false),
@@ -413,6 +458,9 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             }
             if let Some(v) = input.block_crawler_ua {
                 s.block_crawler_ua = v;
+            }
+            if let Some(v) = input.browser_only {
+                s.browser_only = v;
             }
             if let Some(v) = input.rewrite_robots {
                 s.rewrite_robots = v;
@@ -973,6 +1021,41 @@ fn normalize_countries(input: Option<Vec<String>>) -> Vec<String> {
     out
 }
 
+/// Add a validated IP/CIDR entry to an allow/block list (dedup by value).
+fn add_ip_entry(list: &mut Vec<IpListEntry>, params: Value) -> RpcResult {
+    let p: IpEntryInput = parse(params)?;
+    let value = p.value.trim().to_string();
+    if value.is_empty() {
+        return Err(RpcError::invalid_params("`value` is required"));
+    }
+    if matches!(
+        crate::iprange::IpMatcher::parse(&value),
+        crate::iprange::IpMatcher::Never
+    ) {
+        return Err(RpcError::invalid_params("not a valid IP or CIDR"));
+    }
+    if !list.iter().any(|e| e.value == value) {
+        list.insert(
+            0,
+            IpListEntry {
+                value: value.clone(),
+                note: p.note.unwrap_or_default(),
+            },
+        );
+    }
+    audit("ip.list.add", &value);
+    ok(json!({ "value": value }))
+}
+
+/// Remove an entry from an allow/block list by value.
+fn remove_ip_entry(list: &mut Vec<IpListEntry>, params: Value) -> RpcResult {
+    let p: IpValueInput = parse(params)?;
+    let before = list.len();
+    list.retain(|e| e.value != p.value);
+    audit("ip.list.remove", &p.value);
+    ok(json!({ "removed": before != list.len() }))
+}
+
 fn set_route_enabled(store: &mut crate::state::Store, params: Value, enabled: bool) -> RpcResult {
     let p: IdParam = parse(params)?;
     let r = store
@@ -1038,6 +1121,15 @@ fn apply_settings(s: &mut Settings, input: SettingsInput) {
     }
     if let Some(v) = input.request_timeout_secs {
         s.request_timeout_secs = v;
+    }
+    if let Some(v) = input.auto_ban_enabled {
+        s.auto_ban_enabled = v;
+    }
+    if let Some(v) = input.auto_ban_threshold {
+        s.auto_ban_threshold = v.max(1);
+    }
+    if let Some(v) = input.auto_ban_duration_secs {
+        s.auto_ban_duration_secs = v.max(0);
     }
     if let Some(a) = input.acme {
         if let Some(v) = a.enabled {
@@ -1266,6 +1358,7 @@ struct SiteInput {
     max_body_mb: Option<u64>,
     upstream_timeout_secs: Option<u64>,
     block_crawler_ua: Option<bool>,
+    browser_only: Option<bool>,
     rewrite_robots: Option<bool>,
     blocked_countries: Option<Vec<String>>,
     block_datacenter: Option<bool>,
@@ -1333,7 +1426,27 @@ struct SettingsInput {
     worker_threads: Option<u32>,
     max_connections: Option<u32>,
     request_timeout_secs: Option<u32>,
+    auto_ban_enabled: Option<bool>,
+    auto_ban_threshold: Option<u32>,
+    auto_ban_duration_secs: Option<i64>,
     acme: Option<AcmeInput>,
+}
+
+#[derive(Deserialize)]
+struct IpEntryInput {
+    value: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IpValueInput {
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct IpBanInput {
+    ip: String,
 }
 
 #[derive(Deserialize)]

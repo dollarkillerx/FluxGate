@@ -126,6 +126,20 @@ page!(
     "Request blocked",
     "Your request was blocked by the FluxGate Web Application Firewall."
 );
+page!(
+    block_banned,
+    403,
+    RED,
+    "Access denied",
+    "Your IP address has been blocked from this service."
+);
+page!(
+    block_ua,
+    403,
+    RED,
+    "Browser required",
+    "This site only accepts traffic from a web browser."
+);
 
 #[cfg(test)]
 mod tests {

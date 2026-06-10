@@ -43,6 +43,8 @@ pub struct Config {
     pub asn_path: Option<PathBuf>,
     /// Per-site byte-traffic totals JSON file (`None` = in-memory only).
     pub traffic_path: Option<PathBuf>,
+    /// Auto-ban persistence JSON file (`None` = in-memory only).
+    pub bans_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -74,6 +76,8 @@ pub struct AppState {
     /// Cloudflare published IP ranges (v4 + v6), for the per-site "Cloudflare-only"
     /// access control. Loaded once at startup.
     pub cf_ranges: Arc<crate::iprange::CidrList>,
+    /// IP access control: allow/block lists + auto-ban.
+    pub access: Arc<crate::access::AccessControl>,
 }
 
 impl AppState {
@@ -104,7 +108,7 @@ impl AppState {
         // clobbering the operator's edits or custom rules.
         let known: std::collections::HashSet<String> =
             store.waf_rules.iter().map(|r| r.id.clone()).collect();
-        let new_rules: Vec<_> = crate::persist::default_waf_rules()
+        let new_rules: Vec<_> = crate::persist::seed_waf_rules()
             .into_iter()
             .filter(|r| !known.contains(&r.id))
             .collect();
@@ -142,6 +146,8 @@ impl AppState {
             config.traffic_path.clone(),
         ));
         let cf_ranges = Arc::new(crate::cloudflare::load());
+        let access = Arc::new(crate::access::AccessControl::new(config.bans_path.clone()));
+        access.rebuild(&store.ip_whitelist, &store.ip_blacklist);
         Self {
             config: Arc::new(config),
             store: Arc::new(Mutex::new(store)),
@@ -150,7 +156,9 @@ impl AppState {
             // work with (≈5 MB at 20k entries).
             logs: Arc::new(Mutex::new(LogBuffer::new(20_000, log_path))),
             waf,
-            waf_events: Arc::new(Mutex::new(EventBuffer::new(500, event_path))),
+            // Keep enough recent WAF events in memory for the 24h risk analytics
+            // (~0.8 MB at ~400 B/event); the on-disk JSONL retains the full history.
+            waf_events: Arc::new(Mutex::new(EventBuffer::new(2000, event_path))),
             inflight: Arc::new(AtomicI64::new(0)),
             proxy_client: Arc::new(crate::proxy::build_client()),
             lb_cursor: Arc::new(Mutex::new(HashMap::new())),
@@ -158,6 +166,7 @@ impl AppState {
             login_throttle: Arc::new(crate::throttle::LoginThrottle::new()),
             traffic,
             cf_ranges,
+            access,
         }
     }
 
@@ -176,6 +185,13 @@ pub struct Store {
     pub waf_rules: Vec<WafRule>,
     pub certs: Vec<TlsCertificate>,
     pub settings: Settings,
+    /// Manual IP allow-list (fully trusted — skips block-list, auto-ban, per-site
+    /// access controls and the WAF).
+    #[serde(default)]
+    pub ip_whitelist: Vec<IpListEntry>,
+    /// Manual IP block-list (always denied).
+    #[serde(default)]
+    pub ip_blacklist: Vec<IpListEntry>,
     /// Admin credentials (never returned by `settings.get`).
     #[serde(default)]
     pub auth: AuthCreds,

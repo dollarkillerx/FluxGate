@@ -37,6 +37,11 @@ pub struct Site {
     /// Block known crawler / bot User-Agents with 403.
     #[serde(default)]
     pub block_crawler_ua: bool,
+    /// UA allow-list mode: only accept **web-browser** User-Agents (plus
+    /// Cloudflare's own probes); deny everything else (curl, scripts, bots, empty
+    /// UA…). Stricter than `block_crawler_ua`.
+    #[serde(default)]
+    pub browser_only: bool,
     /// Serve a disallow-all `robots.txt` instead of proxying it to the origin.
     #[serde(default)]
     pub rewrite_robots: bool,
@@ -184,6 +189,9 @@ pub struct SecurityEvent {
     pub rule: String,
     pub action: WafAction,
     pub path: String,
+    /// Attacker User-Agent (truncated), for the risk board's UA breakdown.
+    #[serde(default)]
+    pub user_agent: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +295,26 @@ pub struct DeviceStat {
     pub requests: u64,
 }
 
+/// WAF-block count grouped by attacker User-Agent (for the risk board top-N).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UaStat {
+    pub ua: String,
+    pub count: u64,
+}
+
+/// Risk-board attack analytics over the last 24h, derived from WAF events.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttackOverview {
+    /// Total WAF blocks (deny + challenge) in the window.
+    pub total: u64,
+    /// 24 hourly points of block counts (oldest → newest).
+    pub timeline: Vec<TrafficPoint>,
+    /// Top attacker User-Agents.
+    pub top_uas: Vec<UaStat>,
+    /// Attack-source country breakdown (GeoIP on the client IP).
+    pub top_countries: Vec<CountryStat>,
+}
+
 /// Byte-traffic totals for a site (or the whole proxy): cumulative, last 30 days,
 /// and today. `total_requests` is the cumulative metered response count.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -360,6 +388,40 @@ pub struct Settings {
     pub worker_threads: u32,
     pub max_connections: u32,
     pub request_timeout_secs: u32,
+    /// Auto-ban: when on, an IP that trips `auto_ban_threshold` WAF **denies**
+    /// within 24h is blocked for `auto_ban_duration_secs` (`0` = permanent).
+    #[serde(default)]
+    pub auto_ban_enabled: bool,
+    #[serde(default = "default_auto_ban_threshold")]
+    pub auto_ban_threshold: u32,
+    #[serde(default = "default_auto_ban_duration_secs")]
+    pub auto_ban_duration_secs: i64,
+}
+
+fn default_auto_ban_threshold() -> u32 {
+    20
+}
+fn default_auto_ban_duration_secs() -> i64 {
+    5 * 3600
+}
+
+/// A manual IP/CIDR allow- or block-list entry (admin-managed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpListEntry {
+    /// An IP or CIDR (IPv4 or IPv6), e.g. `203.0.113.5` or `10.0.0.0/24`.
+    pub value: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// An active auto-ban, surfaced to the admin (for the list + unban).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanEntry {
+    pub ip: String,
+    /// Epoch second the ban expires; `0` (or far future) = permanent.
+    pub expires_at: i64,
+    /// Recorded WAF denies that triggered / sustain the ban.
+    pub deny_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

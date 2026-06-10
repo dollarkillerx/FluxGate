@@ -21,6 +21,8 @@ export interface Site {
   upstream_timeout_secs?: number
   /** Block known crawler/bot User-Agents with 403. */
   block_crawler_ua?: boolean
+  /** Only allow web-browser (or Cloudflare) User-Agents; deny everything else. */
+  browser_only?: boolean
   /** Serve a disallow-all robots.txt instead of proxying it. */
   rewrite_robots?: boolean
   /** Deny clients from these ISO-3166-1 alpha-2 countries (GeoIP). */
@@ -88,6 +90,7 @@ export interface SecurityEvent {
   rule: string
   action: WafAction
   path: string
+  user_agent?: string
 }
 
 export type CertStatus = 'valid' | 'expiring' | 'expired' | 'pending'
@@ -156,6 +159,43 @@ export interface CountryStat {
 export interface DeviceStat {
   device: string
   requests: number
+}
+
+/** WAF-block count by attacker User-Agent (risk board). */
+export interface UaStat {
+  ua: string
+  count: number
+}
+
+/** A manual IP/CIDR allow- or block-list entry. */
+export interface IpListEntry {
+  value: string
+  note?: string
+}
+
+/** An active auto-ban (`expires_at` 0 = permanent). */
+export interface BanEntry {
+  ip: string
+  expires_at: number
+  deny_count: number
+}
+
+/** Response of `ip.list`. */
+export interface IpAccessData {
+  whitelist: IpListEntry[]
+  blacklist: IpListEntry[]
+  bans: BanEntry[]
+  auto_ban_enabled: boolean
+  auto_ban_threshold: number
+  auto_ban_duration_secs: number
+}
+
+/** Risk-board attack analytics over the last 24h. */
+export interface AttackOverview {
+  total: number
+  timeline: TrafficPoint[]
+  top_uas: UaStat[]
+  top_countries: CountryStat[]
 }
 
 /** Byte-traffic totals for a site (or the whole proxy). */

@@ -145,10 +145,12 @@ async fn proxy_handler(
         .next()
         .unwrap_or("")
         .to_string();
-    // Real client IP: prefer Cloudflare's `CF-Connecting-IP`, then the first
-    // `X-Forwarded-For` hop, else the socket peer. (Gates that must not be
-    // spoofable — e.g. Cloudflare-only — use the raw `peer` instead.)
-    let client_ip = headers
+    // Provisional client IP for **pre-routing** use only: the load-balancer
+    // IP-hash and ACME / early-return logging. The forwarded client is used if
+    // present (so IP-hash stays sticky per real client behind a proxy/CF) — this
+    // is *not* a security decision. The authoritative, unspoofable IP is resolved
+    // after routing (`real_ip`) and drives every access / analytics decision.
+    let mut client_ip = headers
         .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
@@ -160,14 +162,38 @@ async fn proxy_handler(
                 .map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|| peer.ip().to_string());
+    // User-Agent (borrowed from the cloned headers, valid for the whole handler):
+    // feeds the device breakdown and is recorded on WAF events for the risk board.
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     // Device/OS class for the dashboard breakdown — parsed once, logged on every
     // request below (a `&'static str`, so it's cheap to pass around).
-    let device = device_class(
-        headers
-            .get(header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-    );
+    let device = device_class(ua);
+    let now_ts = Utc::now().timestamp();
+    let peer_ip = peer.ip();
+
+    // --- Fast pre-routing block (socket peer) -------------------------------
+    // A block-listed / auto-banned **peer** is denied immediately, on any host
+    // (even unconfigured ones), before any routing work — a cheap DoS
+    // short-circuit. Behind Cloudflare the peer is an edge IP, so the real client
+    // is re-checked after routing (`real_ip`). Whitelisted peers skip this.
+    if !state.access.is_whitelisted(peer_ip) && state.access.is_blocked(peer_ip, now_ts) {
+        log_request(
+            &state,
+            &client_ip,
+            &method,
+            &host,
+            &path,
+            403,
+            started,
+            "-",
+            WafAction::Deny,
+            device,
+        );
+        return (StatusCode::FORBIDDEN, Html(crate::pages::block_banned())).into_response();
+    }
 
     // --- ACME HTTP-01 challenge ---------------------------------------------
     // Served BEFORE any routing/redirect so certificate issuance never disrupts
@@ -267,29 +293,65 @@ async fn proxy_handler(
         max_body_mb,
         upstream_timeout_secs,
         block_crawler_ua,
+        browser_only,
         rewrite_robots,
         blocked_countries,
         block_datacenter,
         cloudflare_only,
+        auto_ban,
     } = target;
 
+    // Did this (Cloudflare-fronted) site's connection actually arrive from a CF
+    // edge? Scanned only for `cloudflare_only` sites (short-circuit), and reused by
+    // both the real-IP resolution and the Cloudflare-only gate below.
+    let peer_is_cf = cloudflare_only && state.cf_ranges.contains(peer.ip());
+
+    // Real client IP, now that we know the matched site. `CF-Connecting-IP` is
+    // trusted **only** when the operator declared this site Cloudflare-fronted
+    // ("Only allow Cloudflare") *and* the connection actually arrived from a
+    // Cloudflare edge — otherwise a forged header (e.g. via someone else's CF
+    // Worker hitting an exposed origin) could spoof it. Every other case uses the
+    // unspoofable socket peer. Drives access decisions + logging / rate-limit /
+    // analytics. (CF-fronted sites should enable "Only allow Cloudflare" to get
+    // real visitor IPs.)
+    let real_ip = if peer_is_cf {
+        headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+            .unwrap_or_else(|| peer.ip())
+    } else {
+        peer.ip()
+    };
+    client_ip = real_ip.to_string();
+
+    // --- IP access control (global allow/block + auto-ban) ------------------
+    // Whitelisted IPs are fully trusted and skip everything below. The block list
+    // was already checked on the peer pre-routing; re-check only when Cloudflare
+    // resolved a *different* real client IP (avoids a redundant scan for direct
+    // traffic, where `real_ip == peer`).
+    let whitelisted = state.access.is_whitelisted(real_ip);
+    if real_ip != peer_ip && !whitelisted && state.access.is_blocked(real_ip, now_ts) {
+        log_request(
+            &state,
+            &client_ip,
+            &method,
+            &host,
+            &path,
+            403,
+            started,
+            "-",
+            WafAction::Deny,
+            device,
+        );
+        return (StatusCode::FORBIDDEN, Html(crate::pages::block_banned())).into_response();
+    }
+
     // --- Site IP access controls (site Advanced options) --------------------
-    // The geo / datacenter gates must judge the *real* client, not a spoofable
-    // header: `CF-Connecting-IP` is trusted only when the connection genuinely
-    // came from a Cloudflare edge (peer ∈ CF ranges); otherwise the socket peer is
-    // used. Without this, a direct visitor could set `CF-Connecting-IP` to a
-    // permitted country / residential IP and walk past a region or datacenter
-    // block. Computed only when one of those gates is active.
-    let gate_ip = if !blocked_countries.is_empty() || block_datacenter {
-        if state.cf_ranges.contains(peer.ip()) {
-            headers
-                .get("cf-connecting-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| peer.ip().to_string())
-        } else {
-            peer.ip().to_string()
-        }
+    // Whitelisted clients skip all of these (and the WAF). The geo / datacenter
+    // gates judge the trusted `real_ip` (Cloudflare-aware, unspoofable).
+    let gate_ip = if !whitelisted && (!blocked_countries.is_empty() || block_datacenter) {
+        real_ip.to_string()
     } else {
         String::new()
     };
@@ -297,7 +359,7 @@ async fn proxy_handler(
     // Cloudflare-only: the connection must originate from a Cloudflare edge. We
     // check the raw TCP **peer** (a forwarded header would be spoofable), so this
     // blocks direct-to-origin bypass attempts.
-    if cloudflare_only && !state.cf_ranges.contains(peer.ip()) {
+    if !whitelisted && cloudflare_only && !peer_is_cf {
         log_request(
             &state,
             &client_ip,
@@ -317,7 +379,7 @@ async fn proxy_handler(
             .into_response();
     }
     // Geo block: deny configured countries (judged on the trusted gate IP).
-    if !blocked_countries.is_empty() {
+    if !whitelisted && !blocked_countries.is_empty() {
         if let Some(cc) = state.waf.country_of(&gate_ip) {
             if blocked_countries
                 .iter()
@@ -340,7 +402,7 @@ async fn proxy_handler(
         }
     }
     // Datacenter / cloud block ("non-residential"): deny known hosting ASNs.
-    if block_datacenter && state.waf.is_datacenter(&gate_ip) {
+    if !whitelisted && block_datacenter && state.waf.is_datacenter(&gate_ip) {
         log_request(
             &state,
             &client_ip,
@@ -382,8 +444,26 @@ async fn proxy_handler(
         )
             .into_response();
     }
+    // Browser-only: allow only web-browser (or Cloudflare) User-Agents, deny the
+    // rest (curl/scripts/bots/empty UA). UA filtering is heuristic (UAs are
+    // spoofable), so pair it with the WAF/challenge for real protection.
+    if !whitelisted && browser_only && !is_browser_ua(ua) {
+        log_request(
+            &state,
+            &client_ip,
+            &method,
+            &host,
+            &path,
+            403,
+            started,
+            "-",
+            WafAction::Deny,
+            device,
+        );
+        return (StatusCode::FORBIDDEN, Html(crate::pages::block_ua())).into_response();
+    }
     // Block known crawler / bot User-Agents with 403.
-    if block_crawler_ua && is_crawler_ua(&headers) {
+    if !whitelisted && block_crawler_ua && is_crawler_ua(&headers) {
         log_request(
             &state,
             &client_ip,
@@ -399,8 +479,8 @@ async fn proxy_handler(
         return (StatusCode::FORBIDDEN, Html(crate::pages::block_crawler())).into_response();
     }
 
-    // --- WAF enforcement (only when the matched path has WAF enabled) --------
-    if waf_enabled {
+    // --- WAF enforcement (only when WAF is enabled and not whitelisted) ------
+    if waf_enabled && !whitelisted {
         let lc_headers: HashMap<String, String> = headers
             .iter()
             .filter_map(|(k, v)| {
@@ -424,7 +504,8 @@ async fn proxy_handler(
         match decision.action {
             WafAction::Allow => {}
             WafAction::Deny => {
-                record_event(&state, &client_ip, &path, &decision, decision.action);
+                record_event(&state, &client_ip, &path, &decision, decision.action, ua);
+                note_deny(&state, real_ip, now_ts, auto_ban);
                 log_request(
                     &state,
                     &client_ip,
@@ -446,7 +527,7 @@ async fn proxy_handler(
                 let now_ts = Utc::now().timestamp();
                 let cookie = headers.get("cookie").and_then(|v| v.to_str().ok());
                 if !crate::challenge::has_clearance(cookie, &state.config.admin_token, now_ts) {
-                    record_event(&state, &client_ip, &path, &decision, decision.action);
+                    record_event(&state, &client_ip, &path, &decision, decision.action, ua);
                     log_request(
                         &state,
                         &client_ip,
@@ -526,7 +607,8 @@ async fn proxy_handler(
                     match decision.action {
                         WafAction::Allow => {}
                         WafAction::Deny => {
-                            record_event(&state, &client_ip, &path, &decision, decision.action);
+                            record_event(&state, &client_ip, &path, &decision, decision.action, ua);
+                            note_deny(&state, real_ip, now_ts, auto_ban);
                             log_request(
                                 &state,
                                 &client_ip,
@@ -550,7 +632,14 @@ async fn proxy_handler(
                                 &state.config.admin_token,
                                 now_ts,
                             ) {
-                                record_event(&state, &client_ip, &path, &decision, decision.action);
+                                record_event(
+                                    &state,
+                                    &client_ip,
+                                    &path,
+                                    &decision,
+                                    decision.action,
+                                    ua,
+                                );
                                 log_request(
                                     &state,
                                     &client_ip,
@@ -820,11 +909,14 @@ struct Target {
     upstream_timeout_secs: u64,
     /// Site crawler controls (Advanced options).
     block_crawler_ua: bool,
+    browser_only: bool,
     rewrite_robots: bool,
     /// Site IP access controls (Advanced options).
     blocked_countries: Vec<String>,
     block_datacenter: bool,
     cloudflare_only: bool,
+    /// Global auto-ban config (from settings) — applied on WAF denies.
+    auto_ban: crate::access::AutoBanCfg,
 }
 
 /// Resolve `host` → enabled site → longest-prefix enabled path route, then a
@@ -861,10 +953,16 @@ fn pick_target(
     let max_body_mb = site.max_body_mb;
     let upstream_timeout_secs = site.upstream_timeout_secs;
     let block_crawler_ua = site.block_crawler_ua;
+    let browser_only = site.browser_only;
     let rewrite_robots = site.rewrite_robots;
     let blocked_countries = site.blocked_countries.clone();
     let block_datacenter = site.block_datacenter;
     let cloudflare_only = site.cloudflare_only;
+    let auto_ban = crate::access::AutoBanCfg {
+        enabled: store.settings.auto_ban_enabled,
+        threshold: store.settings.auto_ban_threshold,
+        duration_secs: store.settings.auto_ban_duration_secs,
+    };
     let mut cursor = state.lb_cursor.lock();
     match select_node(upstream, client_ip, &mut cursor) {
         Some(address) => RouteOutcome::Found(Target {
@@ -875,10 +973,12 @@ fn pick_target(
             max_body_mb,
             upstream_timeout_secs,
             block_crawler_ua,
+            browser_only,
             rewrite_robots,
             blocked_countries,
             block_datacenter,
             cloudflare_only,
+            auto_ban,
         }),
         None => RouteOutcome::NoHealthyUpstream,
     }
@@ -972,6 +1072,38 @@ const CRAWLER_UA_MARKERS: &[&str] = &[
     "headlesschrome",
     "phantomjs",
 ];
+
+/// Whether a User-Agent looks like a real **web browser** — or Cloudflare's own
+/// probes (so health checks / always-online aren't blocked when behind CF). Used
+/// by the per-site browser-only allow-list. Heuristic by nature (UAs are
+/// spoofable): it lets genuine browsers + CF through and drops the obvious
+/// non-browser clients (curl, scripts, bots, empty UA).
+fn is_browser_ua(ua: &str) -> bool {
+    let u = ua.to_ascii_lowercase();
+    if u.is_empty() {
+        return false;
+    }
+    // Cloudflare's own probe / always-online User-Agents.
+    if u.contains("cloudflare") {
+        return true;
+    }
+    // Real browsers all carry a Mozilla token plus an engine/brand marker.
+    if !u.starts_with("mozilla/") {
+        return false;
+    }
+    [
+        "applewebkit",
+        "gecko",
+        "chrome",
+        "firefox",
+        "safari",
+        "edg",
+        "opr/",
+        "trident",
+    ]
+    .iter()
+    .any(|m| u.contains(m))
+}
 
 /// Whether the request's `User-Agent` looks like a crawler/bot.
 fn is_crawler_ua(headers: &HeaderMap) -> bool {
@@ -1279,12 +1411,34 @@ fn log_request(
     state.logs.lock().record(entry);
 }
 
+/// Feed a WAF **deny** into the auto-ban counter (using the unspoofable real IP).
+/// When it trips a ban, log it. No-op when auto-ban is disabled.
+fn note_deny(
+    state: &AppState,
+    real_ip: std::net::IpAddr,
+    now: i64,
+    cfg: crate::access::AutoBanCfg,
+) {
+    // Off by default — skip before allocating the IP string on the deny path.
+    if !cfg.enabled {
+        return;
+    }
+    if let Some(expires) = state.access.record_deny(&real_ip.to_string(), now, cfg) {
+        if expires == 0 {
+            tracing::warn!(target: "fluxgate::audit", ip = %real_ip, "auto-banned permanently");
+        } else {
+            tracing::warn!(target: "fluxgate::audit", ip = %real_ip, until = expires, "auto-banned");
+        }
+    }
+}
+
 fn record_event(
     state: &AppState,
     client_ip: &str,
     path: &str,
     decision: &crate::waf::WafDecision,
     action: WafAction,
+    user_agent: &str,
 ) {
     let event = SecurityEvent {
         id: format!("ev-{}", Utc::now().timestamp_millis()),
@@ -1296,6 +1450,8 @@ fn record_event(
             .unwrap_or_else(|| "default policy".into()),
         action,
         path: path.to_string(),
+        // Bound the stored UA so a pathological header can't bloat the JSONL.
+        user_agent: user_agent.chars().take(200).collect(),
     };
     state.waf_events.lock().record(event);
 }
@@ -1517,6 +1673,32 @@ mod tests {
             );
         }
         println!();
+    }
+
+    #[test]
+    fn browser_ua_allows_browsers_and_cloudflare_only() {
+        // Real browsers + Cloudflare probes pass.
+        for ua in [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1 Version/17 Safari/605.1",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605 Mobile Safari/604",
+            "Cloudflare-Traffic-Manager/1.0",
+            "Mozilla/5.0 (compatible; Cloudflare-AlwaysOnline/1.0)",
+        ] {
+            assert!(is_browser_ua(ua), "should allow: {ua}");
+        }
+        // Tools / scripts / bots / empty are denied.
+        for ua in [
+            "curl/8.7.1",
+            "python-requests/2.31",
+            "Go-http-client/1.1",
+            "sqlmap/1.5",
+            "",
+            "PostmanRuntime/7.0",
+        ] {
+            assert!(!is_browser_ua(ua), "should deny: {ua:?}");
+        }
     }
 
     #[test]

@@ -12,10 +12,11 @@ through a clean web console (English / 中文 / 日本語).
 ## Features
 
 - 🔁 **Reverse proxy** — sites & path routes, load balancing, WebSocket & streaming
-- 🛡️ **WAF** — OWASP **Core Rule Set (CRS)** built in (SQLi, XSS, RCE, LFI/RFI, scanner detection…), inspecting the **request line, headers _and_ body**; custom IP (IPv4 **+ IPv6**) / path / method / geo / rate-limit / **body** rules; a managed human-verification challenge; and per-IP **brute-force lockout** on the admin login
-- 🌍 **Per-site access control** — block by **country** (GeoIP), block **datacenter / cloud IPs** (ASN ≈ "residential only"), or accept **only Cloudflare** traffic. Bound to the site and enforced **even when the WAF is off**; Cloudflare-aware (`CF-Connecting-IP`)
+- 🛡️ **WAF** — OWASP **Core Rule Set (CRS) enabled by default** (SQLi, XSS, RCE, LFI/RFI, scanner detection…), inspecting the **request line, headers _and_ body**; custom IP (IPv4 **+ IPv6**) / path / method / geo / rate-limit / **body** rules; a managed human-verification challenge; and per-IP **brute-force lockout** on the admin login
+- 🌍 **Per-site access control** — block by **country** (GeoIP), block **datacenter / cloud IPs** (ASN ≈ "residential only"), accept **only Cloudflare** traffic, or **browser-only** (User-Agent allow-list). Bound to the site and enforced **even when the WAF is off**; Cloudflare-aware (`CF-Connecting-IP`)
+- 🚫 **IP allow / block lists + auto-ban** — manual allow (full-trust) & block lists, plus optional **auto-ban**: block an IP after _N_ WAF denies in 24h, for a set duration or permanently. Dual-stack (IPv4/IPv6), with one-click unban
 - 🔐 **TLS** — SNI certificate selection + **automatic ACME (Let's Encrypt) issuance & renewal** over HTTP-01
-- 📊 **Analytics** — real-time 24h QPS / PV / UV, latency, error rate, visitor-country map, **device / OS breakdown**, and per-site **traffic totals** (lifetime / 30-day / today)
+- 📊 **Analytics & risk board** — real-time 24h QPS / PV / UV, latency, error rate, visitor-country map, **device / OS breakdown**, per-site **traffic totals** (lifetime / 30-day / today), and a **risk board** (WAF blocks 24h, top attacker User-Agents, attack-origin countries)
 - 🖥️ **Admin console** — embedded in the binary, no separate deploy; tri-lingual UI; branded block / challenge / 404 pages
 
 ## Install
@@ -39,8 +40,15 @@ Re-run the same command later to get a **stop / restart / update** menu
 > port 80 reachable from the internet.
 >
 > Each site has **Advanced options** — upload cap (default 500 MB), upstream
-> timeout (120 s), crawler blocking, and **IP access control** (block countries,
-> block datacenter/cloud IPs, or Cloudflare-only).
+> timeout (120 s), crawler blocking, browser-only, and **IP access control**
+> (block countries, block datacenter/cloud IPs, or Cloudflare-only).
+>
+> **IP-based controls** (geo / datacenter / blacklist / auto-ban) judge the real
+> client IP — the socket peer by default, or `CF-Connecting-IP` for sites with
+> **Only allow Cloudflare** enabled (that toggle both locks the origin to
+> Cloudflare _and_ marks the site CF-fronted). So enable it on Cloudflare-fronted
+> sites to get real visitor IPs; behind a **non-Cloudflare** proxy you'll get the
+> proxy IP — whitelist it, or prefer Cloudflare / direct exposure.
 
 ## Run from source
 

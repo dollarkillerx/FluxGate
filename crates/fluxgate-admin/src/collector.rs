@@ -607,6 +607,76 @@ pub fn window_stats(
     }
 }
 
+/// Risk-board attack analytics over the last 24h, derived from recorded WAF
+/// events (every recorded event is a Deny/Challenge block): an hourly block
+/// timeline, the top attacker User-Agents, and the attack-source countries.
+/// Each distinct client IP is geo-resolved once (cached).
+pub fn attack_overview(
+    events: &EventBuffer,
+    now: DateTime<Utc>,
+    country_of: impl Fn(&str) -> Option<String>,
+    top_uas: usize,
+    top_countries: usize,
+) -> AttackOverview {
+    use std::collections::HashMap;
+    let window = WINDOW_HOURS * BUCKET_SECS;
+    let mut buckets = [0u64; 24];
+    let mut ua_counts: HashMap<&str, u64> = HashMap::new();
+    let mut ip_country: HashMap<&str, String> = HashMap::new();
+    let mut country_counts: HashMap<String, u64> = HashMap::new();
+    let mut total = 0u64;
+
+    for e in events.entries() {
+        let Some(t) = parse(&e.time) else { continue };
+        let age = (now - t).num_seconds();
+        if !(0..window).contains(&age) {
+            continue;
+        }
+        total += 1;
+        buckets[(23 - age / BUCKET_SECS) as usize] += 1;
+        let ua = if e.user_agent.is_empty() {
+            "(none)"
+        } else {
+            e.user_agent.as_str()
+        };
+        *ua_counts.entry(ua).or_default() += 1;
+        let cc = ip_country
+            .entry(e.client_ip.as_str())
+            .or_insert_with(|| country_of(&e.client_ip).unwrap_or_else(|| "??".into()));
+        *country_counts.entry(cc.clone()).or_default() += 1;
+    }
+
+    let timeline = (0..24)
+        .map(|i| TrafficPoint {
+            t: format!("-{}h", 23 - i),
+            requests: buckets[i],
+            blocked: buckets[i],
+        })
+        .collect();
+    let mut uas: Vec<UaStat> = ua_counts
+        .into_iter()
+        .map(|(ua, count)| UaStat {
+            ua: ua.to_string(),
+            count,
+        })
+        .collect();
+    uas.sort_by_key(|u| std::cmp::Reverse(u.count));
+    uas.truncate(top_uas);
+    let mut countries: Vec<CountryStat> = country_counts
+        .into_iter()
+        .map(|(country, requests)| CountryStat { country, requests })
+        .collect();
+    countries.sort_by_key(|c| std::cmp::Reverse(c.requests));
+    countries.truncate(top_countries);
+
+    AttackOverview {
+        total,
+        timeline,
+        top_uas: uas,
+        top_countries: countries,
+    }
+}
+
 pub fn top_routes(snap: &[AccessLog]) -> Vec<TopRoute> {
     use std::collections::HashMap;
     let mut counts: HashMap<String, u64> = HashMap::new();

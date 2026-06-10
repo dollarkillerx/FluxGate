@@ -5,9 +5,9 @@ import { useRpc } from '@/hooks/useRpc'
 import { rpc } from '@/api/rpc'
 import { useToast } from '@/context/ToastContext'
 import { useI18n } from '@/i18n/I18nContext'
-import type { SecurityEvent, WafAction, WafMatchType, WafRule } from '@/types'
+import type { WafAction, WafMatchType, WafRule } from '@/types'
 import { PageHeader } from '@/components/ui/PageHeader'
-import { Card, CardBody, CardHeader } from '@/components/ui/Card'
+import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { Toggle } from '@/components/ui/Toggle'
@@ -15,8 +15,8 @@ import { Modal } from '@/components/ui/Modal'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { Field, Input, Select, Textarea } from '@/components/ui/Field'
 import { DataTable } from '@/components/ui/DataTable'
-import { StateView, Spinner } from '@/components/ui/States'
-import { formatNumber, timeAgo } from '@/lib/utils'
+import { StateView } from '@/components/ui/States'
+import { formatNumber } from '@/lib/utils'
 import { wafActionTone } from '@/lib/status'
 
 const col = createColumnHelper<WafRule>()
@@ -41,7 +41,6 @@ export function WafRulesPage() {
   const toast = useToast()
   const { t } = useI18n()
   const { data, loading, error, refetch } = useRpc<WafRule[]>('waf.rule.list')
-  const events = useRpc<SecurityEvent[]>('waf.event.list', { limit: 8 })
   const packs = useRpc<{ id: string; name: string; description: string; rule_count: number }[]>('waf.pack.list')
 
   const [formOpen, setFormOpen] = useState(false)
@@ -167,37 +166,11 @@ export function WafRulesPage() {
         }
       />
 
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
-        <div className="xl:col-span-2">
-          <Card>
-            <StateView loading={loading} error={error} data={data} onRetry={refetch}>
-              {(rows) => <DataTable columns={columns} data={rows} searchPlaceholder={t('waf.search')} emptyMessage={t('waf.empty')} />}
-            </StateView>
-          </Card>
-        </div>
-
-        <Card>
-          <CardHeader title={t('waf.recentBlocks')} description={t('waf.recentBlocksDesc')} />
-          <CardBody className="p-0">
-            {events.data ? (
-              <div className="divide-y divide-slate-100 dark:divide-slate-800">
-                {events.data.map((e) => (
-                  <div key={e.id} className="px-5 py-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <Badge tone={wafActionTone(e.action)} dot>{t(`enum.wafAction.${e.action}`)}</Badge>
-                      <span className="text-xs text-slate-400">{timeAgo(e.time)}</span>
-                    </div>
-                    <p className="mt-1.5 text-sm font-medium text-slate-700 dark:text-slate-200">{e.rule}</p>
-                    <p className="truncate font-mono text-xs text-slate-500 dark:text-slate-400">{e.client_ip} → {e.path}</p>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <Spinner />
-            )}
-          </CardBody>
-        </Card>
-      </div>
+      <Card>
+        <StateView loading={loading} error={error} data={data} onRetry={refetch}>
+          {(rows) => <DataTable columns={columns} data={rows} searchPlaceholder={t('waf.search')} emptyMessage={t('waf.empty')} />}
+        </StateView>
+      </Card>
 
       {/* Create / edit modal */}
       <Modal
