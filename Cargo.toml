@@ -1,6 +1,19 @@
 [workspace]
 resolver = "2"
-members = ["crates/fluxgate-core", "crates/fluxgate-admin"]
+members = [
+    "crates/fluxgate-core",
+    "crates/fluxgate-waf",
+    "crates/fluxgate-admin",
+    "crates/fluxgate-waf-difftest",
+]
+# The difftest crate compiles vendored C (needs a C compiler), so it's excluded
+# from the default set: plain `cargo build`/`cargo test` stays pure-Rust, while
+# CI's `cargo test --workspace` includes it for the Rust-vs-C differential check.
+default-members = [
+    "crates/fluxgate-core",
+    "crates/fluxgate-waf",
+    "crates/fluxgate-admin",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,6 +40,8 @@ mime_guess = "2"
 sysinfo = "0.31"
 num_cpus = "1"
 regex = "1"
+aho-corasick = "1"
+memchr = "2"
 rcgen = "0.13"
 x509-parser = "0.16"
 time = "0.3"

@@ -3,6 +3,8 @@
 //! All enums serialize as `snake_case` strings so the TypeScript frontend can
 //! use matching string-literal unions without a translation layer.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -101,6 +103,12 @@ pub struct Route {
     pub upstream: String,
     /// Per-path WAF toggle (initialised from the site default, overridable).
     pub waf_enabled: bool,
+    /// Per-route override of the semantic-engine mode: `None` inherits the global
+    /// `WafSemanticConfig.mode`; `Some(Monitor)` logs-without-blocking just this
+    /// route (gradual rollout); `Some(Block)` enforces it even if the global is
+    /// Monitor. Governs the semantic engine only (regex rules always enforce).
+    #[serde(default)]
+    pub waf_mode: Option<WafMode>,
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -197,6 +205,36 @@ pub struct WafRule {
     pub priority: u32,
     pub enabled: bool,
     pub hit_count: u64,
+    /// Set once the operator edits the rule via the API. Lets a schema migration
+    /// tell a hand-customized rule from an untouched shipped default without
+    /// relying on a (brittle) pattern-equality check against the current seed.
+    /// Defaults false so rules from older stores (and fresh seeds) deserialize.
+    #[serde(default)]
+    pub user_modified: bool,
+}
+
+/// Deserialize an optional enum from a key string, mapping `""`/missing/unknown
+/// to `None`. Legacy JSONL stored these as bare strings with `""` for regex-rule
+/// events; plain `Option<T>` would fail to parse `""`.
+fn de_opt_module<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<WafModule>, D::Error> {
+    let s = <Option<String> as Deserialize>::deserialize(d)?;
+    Ok(s.as_deref()
+        .filter(|x| !x.is_empty())
+        .and_then(WafModule::from_key))
+}
+fn de_opt_risk<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<WafRisk>, D::Error> {
+    let s = <Option<String> as Deserialize>::deserialize(d)?;
+    Ok(s.as_deref()
+        .filter(|x| !x.is_empty())
+        .and_then(WafRisk::from_key))
+}
+fn de_opt_location<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<WafLocation>, D::Error> {
+    let s = <Option<String> as Deserialize>::deserialize(d)?;
+    Ok(s.as_deref()
+        .filter(|x| !x.is_empty())
+        .and_then(WafLocation::from_key))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,12 +242,334 @@ pub struct SecurityEvent {
     pub id: String,
     pub time: String,
     pub client_ip: String,
+    /// Human display label: the matched regex rule name, or a short semantic
+    /// summary. Typed detail lives in `module`/`risk`/`detail` below.
     pub rule: String,
     pub action: WafAction,
     pub path: String,
     /// Attacker User-Agent (truncated), for the risk board's UA breakdown.
     #[serde(default)]
     pub user_agent: String,
+    // -- Semantic-engine enrichment (`None` for legacy/regex-rule events) --
+    /// Detection module that fired, if a semantic detector.
+    #[serde(default, deserialize_with = "de_opt_module")]
+    pub module: Option<WafModule>,
+    /// Risk level the detector assigned.
+    #[serde(default, deserialize_with = "de_opt_risk")]
+    pub risk: Option<WafRisk>,
+    /// Where in the request the hit was found.
+    #[serde(default, deserialize_with = "de_opt_location")]
+    pub location: Option<WafLocation>,
+    /// Parameter / field / header name that carried the payload.
+    #[serde(default)]
+    pub param: String,
+    /// Truncated snippet of the matched value (for the "add exception" UX).
+    #[serde(default)]
+    pub snippet: String,
+    /// Detector-specific fingerprint / detail (e.g. `libinjection:1c`, `tag:script`).
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Concise machine-readable record of *why* this decision was made — the
+    /// substrate for the risk board's forensics and the future anomaly-score trace.
+    #[serde(default)]
+    pub decision_trace: Option<String>,
+    /// Whether the decision was enforced (blocked/challenged) vs. only logged
+    /// (monitor mode or a `Log` risk action).
+    #[serde(default)]
+    pub enforced: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Semantic WAF engine — modules, risk, policy, exceptions
+// ---------------------------------------------------------------------------
+
+/// A semantic detection module. Serializes to the snake-case keys used both in
+/// [`WafSemanticConfig::modules`] and the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WafModule {
+    Sqli,
+    Xss,
+    Traversal,
+    Cmdi,
+    Ssrf,
+    Proto,
+    Ssti,
+    Nosql,
+    Xxe,
+    Deser,
+    Php,
+    Java,
+}
+
+impl WafModule {
+    /// All modules, in display order.
+    pub const ALL: [WafModule; 12] = [
+        WafModule::Sqli,
+        WafModule::Xss,
+        WafModule::Traversal,
+        WafModule::Cmdi,
+        WafModule::Ssrf,
+        WafModule::Proto,
+        WafModule::Ssti,
+        WafModule::Nosql,
+        WafModule::Xxe,
+        WafModule::Deser,
+        WafModule::Php,
+        WafModule::Java,
+    ];
+
+    /// Stable snake-case key (matches the serde representation).
+    pub fn key(self) -> &'static str {
+        match self {
+            WafModule::Sqli => "sqli",
+            WafModule::Xss => "xss",
+            WafModule::Traversal => "traversal",
+            WafModule::Cmdi => "cmdi",
+            WafModule::Ssrf => "ssrf",
+            WafModule::Proto => "proto",
+            WafModule::Ssti => "ssti",
+            WafModule::Nosql => "nosql",
+            WafModule::Xxe => "xxe",
+            WafModule::Deser => "deser",
+            WafModule::Php => "php",
+            WafModule::Java => "java",
+        }
+    }
+
+    /// Parse a [`key`](Self::key) back into a module (inverse of `key`).
+    pub fn from_key(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.key() == s)
+    }
+}
+
+/// Where in the request a value was extracted from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WafLocation {
+    Path,
+    Query,
+    BodyForm,
+    BodyJson,
+    BodyMultipart,
+    Cookie,
+    Header,
+}
+
+impl WafLocation {
+    pub fn key(self) -> &'static str {
+        match self {
+            WafLocation::Path => "path",
+            WafLocation::Query => "query",
+            WafLocation::BodyForm => "body_form",
+            WafLocation::BodyJson => "body_json",
+            WafLocation::BodyMultipart => "body_multipart",
+            WafLocation::Cookie => "cookie",
+            WafLocation::Header => "header",
+        }
+    }
+
+    /// Parse a [`key`](Self::key) back into a location (inverse of `key`).
+    pub fn from_key(s: &str) -> Option<Self> {
+        const ALL: [WafLocation; 7] = [
+            WafLocation::Path,
+            WafLocation::Query,
+            WafLocation::BodyForm,
+            WafLocation::BodyJson,
+            WafLocation::BodyMultipart,
+            WafLocation::Cookie,
+            WafLocation::Header,
+        ];
+        ALL.into_iter().find(|l| l.key() == s)
+    }
+
+    /// Whether this location is part of the request **body** (so it is only seen
+    /// in the data plane's body-inspection pass).
+    pub fn is_body(self) -> bool {
+        matches!(
+            self,
+            WafLocation::BodyForm | WafLocation::BodyJson | WafLocation::BodyMultipart
+        )
+    }
+}
+
+/// Confidence / severity a detector assigns to a hit. Ordered `Low < Medium < High`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WafRisk {
+    Low,
+    Medium,
+    High,
+}
+
+impl WafRisk {
+    pub fn key(self) -> &'static str {
+        match self {
+            WafRisk::Low => "low",
+            WafRisk::Medium => "medium",
+            WafRisk::High => "high",
+        }
+    }
+
+    /// Parse a [`key`](Self::key) back into a risk level (inverse of `key`).
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "low" => Some(WafRisk::Low),
+            "medium" => Some(WafRisk::Medium),
+            "high" => Some(WafRisk::High),
+            _ => None,
+        }
+    }
+}
+
+/// Site-wide posture for the semantic engine. `Monitor` detects and logs but
+/// never blocks/challenges (safe rollout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WafMode {
+    #[default]
+    Block,
+    Monitor,
+}
+
+/// What to do with a detection at a given risk level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskAction {
+    Block,
+    Challenge,
+    Log,
+}
+
+/// Per-module enable flag plus the action taken at each risk level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleConfig {
+    pub enabled: bool,
+    pub high: RiskAction,
+    pub medium: RiskAction,
+    pub low: RiskAction,
+}
+
+impl ModuleConfig {
+    /// The default low-false-positive posture: high → block, medium → challenge,
+    /// low → log.
+    pub fn standard() -> Self {
+        ModuleConfig {
+            enabled: true,
+            high: RiskAction::Block,
+            medium: RiskAction::Challenge,
+            low: RiskAction::Log,
+        }
+    }
+
+    /// Resolve the configured action for a risk level.
+    pub fn action_for(&self, risk: WafRisk) -> RiskAction {
+        match risk {
+            WafRisk::High => self.high,
+            WafRisk::Medium => self.medium,
+            WafRisk::Low => self.low,
+        }
+    }
+}
+
+/// A tuning exception that suppresses detections matching its scope (a known
+/// false positive an operator has accepted). All set fields must match for the
+/// exception to apply; unset fields are wildcards.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WafException {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Restrict to one module; `None` = any module.
+    #[serde(default)]
+    pub module: Option<WafModule>,
+    /// Match when the request path starts with this prefix; `""` = any path.
+    #[serde(default)]
+    pub path_prefix: String,
+    /// Restrict to a specific parameter / field / header name; `None` = any.
+    #[serde(default)]
+    pub param: Option<String>,
+    /// Restrict to one request location; `None` = any.
+    #[serde(default)]
+    pub location: Option<WafLocation>,
+    #[serde(default)]
+    pub note: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// CRS-style anomaly scoring: sum a severity score across all surviving
+/// detections on a request and **escalate** the action when it crosses a
+/// threshold — so several individually-weak signals (e.g. three `Low`s) together
+/// block, even though no single one would. Opt-in and escalation-only: when off
+/// (the default) nothing changes; when on it can only raise the action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnomalyConfig {
+    pub enabled: bool,
+    /// Summed score at/above which the action is escalated.
+    pub threshold: u32,
+    /// Action to escalate to once the threshold is crossed.
+    pub action: RiskAction,
+}
+
+impl Default for AnomalyConfig {
+    fn default() -> Self {
+        // Severities are Low 2 / Medium 3 / High 5, so threshold 6 needs two
+        // Mediums or three Lows — combinations a single per-module action misses.
+        AnomalyConfig {
+            enabled: false,
+            threshold: 6,
+            action: RiskAction::Challenge,
+        }
+    }
+}
+
+/// Persisted configuration for the semantic detection engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WafSemanticConfig {
+    #[serde(default)]
+    pub mode: WafMode,
+    /// Per-module config, keyed by [`WafModule::key`]. Missing modules fall back
+    /// to [`ModuleConfig::standard`].
+    #[serde(default)]
+    pub modules: BTreeMap<String, ModuleConfig>,
+    /// CRS-style cross-detection anomaly scoring (off by default).
+    #[serde(default)]
+    pub anomaly: AnomalyConfig,
+    #[serde(default)]
+    pub exceptions: Vec<WafException>,
+}
+
+impl Default for WafSemanticConfig {
+    fn default() -> Self {
+        let mut modules = BTreeMap::new();
+        for m in WafModule::ALL {
+            modules.insert(m.key().to_string(), ModuleConfig::standard());
+        }
+        WafSemanticConfig {
+            mode: WafMode::Block,
+            modules,
+            anomaly: AnomalyConfig::default(),
+            exceptions: Vec::new(),
+        }
+    }
+}
+
+impl WafSemanticConfig {
+    /// Config for a module, falling back to the standard posture when absent.
+    pub fn module(&self, m: WafModule) -> ModuleConfig {
+        self.modules
+            .get(m.key())
+            .cloned()
+            .unwrap_or_else(ModuleConfig::standard)
+    }
+
+    /// Whether a module is enabled (default-on when unconfigured).
+    pub fn is_enabled(&self, m: WafModule) -> bool {
+        self.modules.get(m.key()).map(|c| c.enabled).unwrap_or(true)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -449,4 +809,59 @@ pub struct SystemInfo {
     pub pingora_version: String,
     pub uptime_secs: u64,
     pub started_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enum_from_key_roundtrips() {
+        for m in WafModule::ALL {
+            assert_eq!(WafModule::from_key(m.key()), Some(m));
+        }
+        for r in [WafRisk::Low, WafRisk::Medium, WafRisk::High] {
+            assert_eq!(WafRisk::from_key(r.key()), Some(r));
+        }
+        assert_eq!(WafModule::from_key("nope"), None);
+        assert_eq!(
+            WafLocation::from_key("body_json"),
+            Some(WafLocation::BodyJson)
+        );
+    }
+
+    #[test]
+    fn semantic_config_without_anomaly_defaults_off() {
+        // An older store has no `anomaly` field — it must deserialize to the
+        // opt-in default (disabled), so existing installs are unaffected.
+        let cfg: WafSemanticConfig =
+            serde_json::from_str(r#"{"mode":"block","modules":{},"exceptions":[]}"#).unwrap();
+        assert!(!cfg.anomaly.enabled);
+        assert_eq!(cfg.anomaly.threshold, 6);
+    }
+
+    #[test]
+    fn security_event_legacy_strings_deserialize_to_none() {
+        // Legacy JSONL stored empty strings for regex-rule events.
+        let legacy = r#"{"id":"e1","time":"t","client_ip":"1.2.3.4","rule":"r",
+            "action":"deny","path":"/","module":"","risk":"","location":""}"#;
+        let e: SecurityEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(e.module, None);
+        assert_eq!(e.risk, None);
+        assert_eq!(e.location, None);
+        assert_eq!(e.detail, None);
+
+        // Populated semantic event with the typed snake_case strings.
+        let sem = r#"{"id":"e2","time":"t","client_ip":"1.2.3.4","rule":"libinjection:1c",
+            "action":"deny","path":"/","module":"sqli","risk":"high","location":"query",
+            "detail":"libinjection:1c","enforced":true}"#;
+        let e: SecurityEvent = serde_json::from_str(sem).unwrap();
+        assert_eq!(e.module, Some(WafModule::Sqli));
+        assert_eq!(e.risk, Some(WafRisk::High));
+        assert_eq!(e.location, Some(WafLocation::Query));
+        // Round-trips back to snake_case strings (null for the unset fields).
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["module"], "sqli");
+        assert_eq!(json["risk"], "high");
+    }
 }

@@ -16,6 +16,7 @@ import type {
   Route,
   Site,
   SecurityEvent,
+  WafSemanticConfig,
   Settings,
   TlsCertificate,
   TopRoute,
@@ -54,6 +55,8 @@ const routes: Route[] = [
   r('rt-004', 'st-004', 'Asset CDN', '/assets', 'static-storage', false, true, 900),
   r('rt-005', 'st-005', 'Legacy Webhook', '/legacy', 'legacy-box', false, false, 4320),
 ]
+// One route demonstrates the per-route mode override (Monitor while the rest block).
+routes[1].waf_mode = 'monitor'
 function r(
   id: string, site_id: string, name: string, path: string, upstream: string,
   waf: boolean, enabled: boolean, upd: number,
@@ -148,14 +151,45 @@ const logs: AccessLog[] = Array.from({ length: 200 }, (_, i) => {
 const EVENT_RULES = ['Block SQLi patterns', 'Block known bad IPs', 'Challenge suspicious UA', 'Rate-limit login', 'Geo block (sanctioned)']
 const EVENT_PATHS = ["/v1/users?id=1' OR '1'='1", '/login', '/oauth/token', '/admin', '/v1/search']
 const EVENT_IPS = ['203.0.113.42', '203.0.113.5', '198.51.100.200', '192.0.2.99', '203.0.113.77']
-const events: SecurityEvent[] = Array.from({ length: 40 }, (_, i) => ({
-  id: `ev-${String(i).padStart(4, '0')}`,
-  time: ago(i * 7),
-  client_ip: EVENT_IPS[i % EVENT_IPS.length],
-  rule: EVENT_RULES[i % EVENT_RULES.length],
-  action: wobble(i) < 0.5 ? 'deny' : 'challenge',
-  path: EVENT_PATHS[i % EVENT_PATHS.length],
-}))
+const SEM = [
+  { module: 'sqli' as const, risk: 'high' as const, location: 'query' as const, param: 'id', detail: 'libinjection:1c' },
+  { module: 'xss' as const, risk: 'medium' as const, location: 'query' as const, param: 'q', detail: 'tag:script' },
+  { module: 'traversal' as const, risk: 'high' as const, location: 'path' as const, param: '', detail: 'escape:../' },
+]
+const events: SecurityEvent[] = Array.from({ length: 40 }, (_, i) => {
+  const action = wobble(i) < 0.5 ? ('deny' as const) : ('challenge' as const)
+  // Every other event is a semantic-engine detection (typed enrichment); the
+  // rest are legacy/regex-rule events (no module/risk).
+  if (i % 2 === 0) {
+    const s = SEM[i % SEM.length]
+    return {
+      id: `ev-${String(i).padStart(4, '0')}`, time: ago(i * 7),
+      client_ip: EVENT_IPS[i % EVENT_IPS.length], rule: s.detail, action,
+      path: EVENT_PATHS[i % EVENT_PATHS.length], ...s,
+      decision_trace: `module=${s.module} risk=${s.risk} location=${s.location} action=${action} enforced=true`,
+      enforced: true,
+    }
+  }
+  return {
+    id: `ev-${String(i).padStart(4, '0')}`, time: ago(i * 7),
+    client_ip: EVENT_IPS[i % EVENT_IPS.length], rule: EVENT_RULES[i % EVENT_RULES.length],
+    action, path: EVENT_PATHS[i % EVENT_PATHS.length],
+    decision_trace: `regex rule=${EVENT_RULES[i % EVENT_RULES.length]} action=${action}`, enforced: true,
+  }
+})
+
+const stdModule = () => ({ enabled: true, high: 'block' as const, medium: 'challenge' as const, low: 'log' as const })
+let semanticCfg: WafSemanticConfig = {
+  mode: 'block',
+  modules: {
+    sqli: stdModule(), xss: stdModule(), traversal: stdModule(),
+    cmdi: stdModule(), ssrf: stdModule(), proto: stdModule(),
+    ssti: stdModule(), nosql: stdModule(), xxe: stdModule(), deser: stdModule(),
+    php: stdModule(), java: stdModule(),
+  },
+  anomaly: { enabled: false, threshold: 6, action: 'challenge' },
+  exceptions: [],
+}
 
 let settings: Settings = {
   admin_username: 'admin',
@@ -294,6 +328,7 @@ const handlers: Record<string, (p: Params) => unknown> = {
     const route: Route = {
       id: sid('rt'), site_id: p.site_id ?? '', name: p.name ?? '', path: p.path ?? '/',
       upstream: p.upstream ?? '', waf_enabled: p.waf_enabled ?? true,
+      waf_mode: p.waf_mode === 'block' || p.waf_mode === 'monitor' ? p.waf_mode : null,
       enabled: p.enabled ?? true, created_at: now(), updated_at: now(),
     }
     routes.unshift(route)
@@ -302,6 +337,7 @@ const handlers: Record<string, (p: Params) => unknown> = {
   'route.update': (p) => {
     const route = find(routes, p.id, 'route')
     Object.assign(route, pick(p, ['site_id', 'name', 'path', 'upstream', 'waf_enabled', 'enabled']))
+    if (p.waf_mode !== undefined) route.waf_mode = p.waf_mode === 'block' || p.waf_mode === 'monitor' ? p.waf_mode : null
     route.updated_at = now()
     return route
   },
@@ -350,6 +386,20 @@ const handlers: Record<string, (p: Params) => unknown> = {
   'waf.rule.enable': (p) => setFlag(wafRules, p.id, 'enabled', true, 'waf rule'),
   'waf.rule.disable': (p) => setFlag(wafRules, p.id, 'enabled', false, 'waf rule'),
   'waf.event.list': (p) => events.slice(0, p.limit ?? 25),
+
+  // Semantic detection engine (mock state).
+  'waf.semantic.get': () => semanticCfg,
+  'waf.semantic.update': (p) => {
+    semanticCfg = { ...semanticCfg, ...pick(p, ['mode', 'modules', 'exceptions']) }
+    return semanticCfg
+  },
+  'waf.exception.list': () => semanticCfg.exceptions,
+  'waf.exception.create': (p) => {
+    const exc = { id: sid('wx'), enabled: true, module: p.module ?? null, path_prefix: p.path_prefix ?? '', param: p.param ?? null, location: p.location ?? null, note: p.note ?? '' }
+    semanticCfg.exceptions.unshift(exc)
+    return exc
+  },
+  'waf.exception.delete': (p) => del(semanticCfg.exceptions, p.id, 'exception'),
 
   'tls.cert.list': () => certs,
   'tls.cert.get': (p) => find(certs, p.id, 'certificate'),

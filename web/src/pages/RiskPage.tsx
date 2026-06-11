@@ -1,8 +1,11 @@
-import { useMemo } from 'react'
-import { ShieldAlert, Bug, Globe2, Activity } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { ShieldAlert, Bug, Globe2, Activity, ShieldCheck } from 'lucide-react'
 import { useRpc } from '@/hooks/useRpc'
+import { rpc } from '@/api/rpc'
+import { useToast } from '@/context/ToastContext'
 import { useI18n } from '@/i18n/I18nContext'
 import type { AttackOverview, SecurityEvent } from '@/types'
+import { Button } from '@/components/ui/Button'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { LiveIndicator } from '@/components/ui/LiveIndicator'
 import { StatCard } from '@/components/ui/StatCard'
@@ -17,8 +20,35 @@ const REFRESH_MS = 5000
 
 export function RiskPage() {
   const { t, locale } = useI18n()
+  const toast = useToast()
   const attacks = useRpc<AttackOverview>('dashboard.attacks', {}, [], REFRESH_MS)
   const events = useRpc<SecurityEvent[]>('dashboard.security_events', { limit: 30 }, [], REFRESH_MS)
+
+  // Per-event "accept false positive" state: 'pending' while the request is in
+  // flight, 'done' once an exception has been created for that event.
+  const [fpState, setFpState] = useState<Record<string, 'pending' | 'done'>>({})
+
+  const acceptFp = async (e: SecurityEvent) => {
+    if (!e.module || fpState[e.id]) return
+    setFpState((s) => ({ ...s, [e.id]: 'pending' }))
+    try {
+      await rpc.call('waf.exception.create', {
+        module: e.module,
+        path_prefix: e.path,
+        param: e.param || undefined,
+        note: `accepted FP from risk event (${e.rule})`,
+      })
+      setFpState((s) => ({ ...s, [e.id]: 'done' }))
+      toast.success('Exception added', `${e.module} on ${e.path}${e.param ? ` [${e.param}]` : ''} is now allowed`)
+    } catch (err: any) {
+      setFpState((s) => {
+        const n = { ...s }
+        delete n[e.id]
+        return n
+      })
+      toast.error('Could not add exception', err?.message)
+    }
+  }
 
   const regionNames = useMemo(() => {
     try {
@@ -154,11 +184,45 @@ export function RiskPage() {
                       <div className="flex items-center justify-between gap-3">
                         <div className="flex min-w-0 items-center gap-2">
                           <Badge tone={wafActionTone(e.action)} dot>{t(`enum.wafAction.${e.action}`)}</Badge>
+                          {e.module ? <Badge tone="neutral">{e.module}</Badge> : null}
+                          {e.risk ? (
+                            <Badge tone={e.risk === 'high' ? 'danger' : e.risk === 'medium' ? 'warning' : 'neutral'}>{e.risk}</Badge>
+                          ) : null}
+                          {e.enforced === false && e.module ? (
+                            <Badge tone="warning">not enforced</Badge>
+                          ) : null}
                           <span className="truncate text-sm font-medium text-slate-700 dark:text-slate-200">{e.rule}</span>
                         </div>
-                        <span className="shrink-0 text-xs text-slate-400">{timeAgo(e.time)}</span>
+                        <div className="flex shrink-0 items-center gap-2">
+                          {/* One-click accept-false-positive: only for semantic
+                              detections (regex-rule events have no exception to scope). */}
+                          {e.module ? (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              icon={<ShieldCheck size={13} className="text-emerald-500" />}
+                              loading={fpState[e.id] === 'pending'}
+                              disabled={fpState[e.id] === 'done'}
+                              onClick={() => acceptFp(e)}
+                              title={`Accept as false positive — allow ${e.module} on ${e.path}${e.param ? ` [${e.param}]` : ''}`}
+                            >
+                              {fpState[e.id] === 'done' ? 'Accepted' : 'Accept FP'}
+                            </Button>
+                          ) : null}
+                          <span className="text-xs text-slate-400">{timeAgo(e.time)}</span>
+                        </div>
                       </div>
                       <p className="mt-1 truncate font-mono text-xs text-slate-500 dark:text-slate-400">{e.client_ip} → {e.path}</p>
+                      {e.snippet ? (
+                        <p className="mt-0.5 truncate font-mono text-[11px] text-slate-400" title={e.snippet}>
+                          {e.location}{e.param ? `[${e.param}]` : ''}: {e.snippet}
+                        </p>
+                      ) : null}
+                      {e.decision_trace ? (
+                        <p className="mt-0.5 truncate text-[11px] text-slate-400" title={e.decision_trace}>
+                          <span className="text-slate-500 dark:text-slate-500">why:</span> {e.decision_trace}
+                        </p>
+                      ) : null}
                       {e.user_agent ? (
                         <p className="mt-0.5 truncate font-mono text-[11px] text-slate-400" title={e.user_agent}>UA: {e.user_agent}</p>
                       ) : null}

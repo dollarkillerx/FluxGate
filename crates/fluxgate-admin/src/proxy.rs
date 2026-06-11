@@ -140,7 +140,13 @@ async fn proxy_handler(
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| path.clone());
-    let host = header_str(&headers, "host")
+    // Host without port. Borrow the header value and allocate once (the old
+    // `header_str` path allocated the full host string and then a second time for
+    // the port-stripped copy).
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
         .split(':')
         .next()
         .unwrap_or("")
@@ -312,6 +318,7 @@ async fn proxy_handler(
         address,
         waf_enabled,
         default_waf,
+        waf_mode,
         max_body_mb,
         upstream_timeout_secs,
         block_crawler_ua,
@@ -466,6 +473,36 @@ async fn proxy_handler(
         )
             .into_response();
     }
+    // HTTP request smuggling: ambiguous request framing (CL/TE desync) is a
+    // transport-layer attack that can poison the shared upstream connection and
+    // corrupt *other* clients' requests, so it is rejected on EVERY proxied
+    // request — independent of the per-route WAF toggle and the IP whitelist
+    // (forwarding an ambiguously-framed request to the upstream is never safe).
+    if let Some(reason) = detect_smuggling(&headers) {
+        let decision = crate::waf::WafDecision {
+            action: WafAction::Deny,
+            matched_rule_id: Some("request-smuggling".into()),
+            matched_rule_name: Some(format!("HTTP request smuggling: {reason}")),
+        };
+        record_event(&state, &client_ip, &path, &decision, WafAction::Deny, ua);
+        // Don't auto-ban an operator-trusted (whitelisted) IP, but still reject.
+        if !whitelisted {
+            note_deny(&state, real_ip, now_ts, auto_ban);
+        }
+        log_request(
+            &state,
+            &client_ip,
+            &method,
+            &host,
+            &path,
+            400,
+            started,
+            "-",
+            WafAction::Deny,
+            device,
+        );
+        return (StatusCode::BAD_REQUEST, Html(crate::pages::block_waf())).into_response();
+    }
     // Browser-only: allow only web-browser (or Cloudflare) User-Agents, deny the
     // rest (curl/scripts/bots/empty UA). UA filtering is heuristic (UAs are
     // spoofable), so pair it with the WAF/challenge for real protection.
@@ -503,14 +540,10 @@ async fn proxy_handler(
 
     // --- WAF enforcement (only when WAF is enabled and not whitelisted) ------
     if waf_enabled && !whitelisted {
-        let lc_headers: HashMap<String, String> = headers
-            .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|s| (k.as_str().to_lowercase(), s.to_string()))
-            })
-            .collect();
+        // Both engines read the raw `HeaderMap` directly — no per-request
+        // lowercased-copy map: `HeaderMap` name lookup is already case-insensitive,
+        // the regex `Header` matcher lowercases the value it needs at match time,
+        // and the semantic engine lowercases each value internally.
         // Default action came from pick_target's lock; rule evaluation runs
         // against the WAF engine's own lock-free compiled snapshot — no re-lock.
         let default = default_waf;
@@ -520,53 +553,54 @@ async fn proxy_handler(
             method: method.as_str(),
             // Inspect path + query so injection in query params is caught.
             path: &path_and_query,
-            headers: &lc_headers,
+            headers: &headers,
         };
         let decision = state.waf.evaluate(default, &ctx, now_sec);
-        match decision.action {
-            WafAction::Allow => {}
-            WafAction::Deny => {
-                record_event(&state, &client_ip, &path, &decision, decision.action, ua);
-                note_deny(&state, real_ip, now_ts, auto_ban);
-                log_request(
+        if let Some(resp) = enforce_waf_action(
+            &state,
+            WafHit::Regex(&decision),
+            &client_ip,
+            &method,
+            &host,
+            &path,
+            &headers,
+            ua,
+            real_ip,
+            now_ts,
+            auto_ban,
+            started,
+            device,
+        ) {
+            return resp;
+        }
+
+        // --- Semantic WAF (structure-aware) ---------------------------------
+        // Runs only when no regex rule decided (default `Allow` reached), so an
+        // explicit allow/deny rule still short-circuits. Catches injection that
+        // keyword rules miss while keeping false positives near zero.
+        if decision.matched_rule_id.is_none() {
+            if let Some(out) =
+                state
+                    .waf
+                    .semantic_evaluate(&path_and_query, &headers, &path, waf_mode)
+            {
+                if let Some(resp) = enforce_waf_action(
                     &state,
+                    WafHit::Semantic(&out),
                     &client_ip,
                     &method,
                     &host,
                     &path,
-                    403,
+                    &headers,
+                    ua,
+                    real_ip,
+                    now_ts,
+                    auto_ban,
                     started,
-                    "-",
-                    decision.action,
                     device,
-                );
-                return (StatusCode::FORBIDDEN, Html(crate::pages::block_waf())).into_response();
-            }
-            WafAction::Challenge => {
-                // A real managed challenge: clients that already solved the
-                // proof-of-work carry a valid clearance cookie and pass; others
-                // get the interstitial page (and no-JS bots stay blocked).
-                let now_ts = Utc::now().timestamp();
-                let cookie = headers.get("cookie").and_then(|v| v.to_str().ok());
-                if !crate::challenge::has_clearance(cookie, &state.config.admin_token, now_ts) {
-                    record_event(&state, &client_ip, &path, &decision, decision.action, ua);
-                    log_request(
-                        &state,
-                        &client_ip,
-                        &method,
-                        &host,
-                        &path,
-                        503,
-                        started,
-                        "-",
-                        decision.action,
-                        device,
-                    );
-                    let html = crate::challenge::page(&state.config.admin_token, now_ts);
-                    return (StatusCode::SERVICE_UNAVAILABLE, axum::response::Html(html))
-                        .into_response();
+                ) {
+                    return resp;
                 }
-                // Cleared — fall through and proxy the request.
             }
         }
     }
@@ -620,68 +654,69 @@ async fn proxy_handler(
         && !is_ws
         && has_body(&headers, &method)
         && is_inspectable_body(&headers)
-        && state.waf.has_body_rules()
+        && state.waf.wants_body()
     {
         match tokio::time::timeout(BODY_READ_TIMEOUT, read_body_prefix(body, BODY_SCAN_LIMIT)).await
         {
             Ok(Ok((buffered, inspect, rest, complete))) => {
-                if let Some(decision) = state.waf.evaluate_body(&inspect) {
-                    match decision.action {
-                        WafAction::Allow => {}
-                        WafAction::Deny => {
-                            record_event(&state, &client_ip, &path, &decision, decision.action, ua);
-                            note_deny(&state, real_ip, now_ts, auto_ban);
-                            log_request(
-                                &state,
-                                &client_ip,
-                                &method,
-                                &host,
-                                &path,
-                                403,
-                                started,
-                                "-",
-                                decision.action,
-                                device,
-                            );
-                            return (StatusCode::FORBIDDEN, Html(crate::pages::block_waf()))
-                                .into_response();
-                        }
-                        WafAction::Challenge => {
-                            let now_ts = Utc::now().timestamp();
-                            let cookie = headers.get("cookie").and_then(|v| v.to_str().ok());
-                            if !crate::challenge::has_clearance(
-                                cookie,
-                                &state.config.admin_token,
-                                now_ts,
-                            ) {
-                                record_event(
-                                    &state,
-                                    &client_ip,
-                                    &path,
-                                    &decision,
-                                    decision.action,
-                                    ua,
-                                );
-                                log_request(
-                                    &state,
-                                    &client_ip,
-                                    &method,
-                                    &host,
-                                    &path,
-                                    503,
-                                    started,
-                                    "-",
-                                    decision.action,
-                                    device,
-                                );
-                                let html =
-                                    crate::challenge::page(&state.config.admin_token, now_ts);
-                                return (
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    axum::response::Html(html),
-                                )
-                                    .into_response();
-                            }
+                let ct = headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok());
+                // Regex body rules are skipped for multipart/form-data: the raw
+                // prefix includes part headers and (binary) file-part bytes, which
+                // trip text-oriented body regexes (e.g. a `.php` upload matching
+                // the PHP rule). Multipart text fields are still inspected by the
+                // semantic engine below, which skips file parts.
+                let is_multipart = ct
+                    .map(|c| c.to_ascii_lowercase().starts_with("multipart/form-data"))
+                    .unwrap_or(false);
+                let regex_decision = if is_multipart {
+                    None
+                } else {
+                    state.waf.evaluate_body(&inspect)
+                };
+                if let Some(decision) = &regex_decision {
+                    if let Some(resp) = enforce_waf_action(
+                        &state,
+                        WafHit::Regex(decision),
+                        &client_ip,
+                        &method,
+                        &host,
+                        &path,
+                        &headers,
+                        ua,
+                        real_ip,
+                        now_ts,
+                        auto_ban,
+                        started,
+                        device,
+                    ) {
+                        return resp;
+                    }
+                }
+                // Semantic body inspection — only when no explicit regex body rule
+                // decided (mirrors Stage A: an operator allow/deny short-circuits).
+                if regex_decision.is_none() {
+                    if let Some(out) = state
+                        .waf
+                        .semantic_evaluate_body(ct, &inspect, &path, waf_mode)
+                    {
+                        if let Some(resp) = enforce_waf_action(
+                            &state,
+                            WafHit::Semantic(&out),
+                            &client_ip,
+                            &method,
+                            &host,
+                            &path,
+                            &headers,
+                            ua,
+                            real_ip,
+                            now_ts,
+                            auto_ban,
+                            started,
+                            device,
+                        ) {
+                            return resp;
                         }
                     }
                 }
@@ -913,7 +948,10 @@ enum RouteOutcome {
     /// Plaintext request to a TLS-enabled site with HTTP→HTTPS redirect on.
     Redirect,
     /// A site redirect rule matched: answer with `status` (301/302) → `location`.
-    CustomRedirect { location: String, status: u16 },
+    CustomRedirect {
+        location: String,
+        status: u16,
+    },
     Found(Target),
     NoRoute,
     NoHealthyUpstream,
@@ -938,6 +976,8 @@ struct Target {
     address: String,
     waf_enabled: bool,
     default_waf: WafAction,
+    /// Per-route semantic-engine mode override (`None` = inherit the global mode).
+    waf_mode: Option<WafMode>,
     /// Site upload cap in MB (`0` = unlimited) and upstream timeout in secs.
     max_body_mb: u64,
     upstream_timeout_secs: u64,
@@ -995,6 +1035,7 @@ fn pick_target(
         return RouteOutcome::NoRoute;
     };
     let waf_enabled = route.waf_enabled;
+    let waf_mode = route.waf_mode;
     let default_waf = store.settings.default_waf_action;
     let max_body_mb = site.max_body_mb;
     let upstream_timeout_secs = site.upstream_timeout_secs;
@@ -1016,6 +1057,7 @@ fn pick_target(
             address,
             waf_enabled,
             default_waf,
+            waf_mode,
             max_body_mb,
             upstream_timeout_secs,
             block_crawler_ua,
@@ -1076,14 +1118,6 @@ fn fnv1a(s: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
-}
-
-fn header_str(headers: &HeaderMap, name: &str) -> String {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string()
 }
 
 /// Lowercased substrings identifying crawler / scraper User-Agents. Covers
@@ -1161,6 +1195,68 @@ fn is_crawler_ua(headers: &HeaderMap) -> bool {
     !ua.is_empty() && CRAWLER_UA_MARKERS.iter().any(|m| ua.contains(m))
 }
 
+/// Detect HTTP request smuggling — ambiguous request framing that lets a
+/// front-end and back-end disagree about where one request ends and the next
+/// begins (CL.TE / TE.CL / CL.CL desync). Returns a short reason when the framing
+/// is ambiguous, else `None`. Well-framed requests (a plain `Content-Length`
+/// body, a `Transfer-Encoding: chunked` upload, `gzip, chunked`) pass.
+fn detect_smuggling(headers: &HeaderMap) -> Option<&'static str> {
+    let te: Vec<&HeaderValue> = headers.get_all(header::TRANSFER_ENCODING).iter().collect();
+    let cl: Vec<&HeaderValue> = headers.get_all(header::CONTENT_LENGTH).iter().collect();
+
+    // Both present → the classic CL.TE / TE.CL desync.
+    if !te.is_empty() && !cl.is_empty() {
+        return Some("content-length with transfer-encoding");
+    }
+    // Duplicate or self-conflicting Content-Length.
+    if cl.len() > 1 {
+        return Some("multiple content-length headers");
+    }
+    if let Some(v) = cl.first() {
+        let s = v.to_str().unwrap_or("");
+        let mut vals = s.split(',').map(str::trim);
+        let first = vals.next().unwrap_or("");
+        if first.is_empty() || !first.bytes().all(|b| b.is_ascii_digit()) {
+            return Some("invalid content-length");
+        }
+        if vals.any(|p| p != first) {
+            return Some("conflicting content-length values");
+        }
+    }
+    // Transfer-Encoding obfuscation: a desync trick is to make one server see
+    // `chunked` and the other not, via duplicate headers, a non-final `chunked`,
+    // or an unknown/obfuscated coding token.
+    if te.len() > 1 {
+        return Some("multiple transfer-encoding headers");
+    }
+    if let Some(v) = te.first() {
+        let s = v.to_str().unwrap_or("").to_ascii_lowercase();
+        let tokens: Vec<&str> = s
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            return Some("empty transfer-encoding");
+        }
+        if *tokens.last().unwrap() != "chunked" {
+            return Some("transfer-encoding chunked-not-final");
+        }
+        if tokens.iter().filter(|t| **t == "chunked").count() > 1 {
+            return Some("duplicate chunked coding");
+        }
+        if tokens.iter().any(|t| {
+            !matches!(
+                *t,
+                "chunked" | "identity" | "gzip" | "deflate" | "compress" | "x-gzip"
+            )
+        }) {
+            return Some("obfuscated transfer-encoding");
+        }
+    }
+    None
+}
+
 /// Parse the `Content-Length` request header, if present and valid.
 fn content_length(headers: &HeaderMap) -> Option<u64> {
     headers
@@ -1220,6 +1316,9 @@ fn is_inspectable_body(headers: &HeaderMap) -> bool {
                 || ct.starts_with("application/json")
                 || ct.starts_with("application/graphql")
                 || ct.starts_with("application/javascript")
+                // Text (non-file) multipart fields are extracted; file parts are
+                // skipped by the semantic extractor, so this is safe to inspect.
+                || ct.starts_with("multipart/form-data")
                 || ct.starts_with("text/")
                 || ct.contains("xml")
         }
@@ -1428,6 +1527,99 @@ fn device_class(ua: &str) -> &'static str {
     "other"
 }
 
+/// One WAF detection to enforce — a regex-rule decision or a semantic outcome.
+/// Tells [`enforce_waf_action`] which event kind to record.
+enum WafHit<'a> {
+    Regex(&'a crate::waf::WafDecision),
+    Semantic(&'a crate::waf_semantic::SemanticOutcome),
+}
+
+/// Apply a WAF hit's action on the data plane and return `Some(response)` to
+/// short-circuit the request, or `None` to continue. Deny → 403 block page;
+/// Challenge → 503 interstitial unless the client already holds clearance; Allow
+/// → record-only for a semantic observation (monitor/log), silent for regex.
+///
+/// The single home for the block/challenge response, previously copy-pasted
+/// across four call sites (regex/semantic × header/body) — the duplication is
+/// what let their event recording and clearance handling drift apart.
+#[allow(clippy::too_many_arguments)]
+fn enforce_waf_action(
+    state: &AppState,
+    hit: WafHit,
+    client_ip: &str,
+    method: &Method,
+    host: &str,
+    path: &str,
+    headers: &HeaderMap,
+    ua: &str,
+    real_ip: std::net::IpAddr,
+    now_ts: i64,
+    auto_ban: crate::access::AutoBanCfg,
+    started: Instant,
+    device: &str,
+) -> Option<Response> {
+    let action = match &hit {
+        WafHit::Regex(d) => d.action,
+        WafHit::Semantic(o) => o.action,
+    };
+    let record = |state: &AppState| match &hit {
+        WafHit::Regex(d) => record_event(state, client_ip, path, d, d.action, ua),
+        WafHit::Semantic(o) => record_semantic_event(state, client_ip, path, o, ua),
+    };
+    match action {
+        WafAction::Allow => {
+            // Monitor mode / low-risk: a semantic outcome is recorded as an
+            // observation; an explicit regex Allow is silent.
+            if matches!(hit, WafHit::Semantic(_)) {
+                record(state);
+            }
+            None
+        }
+        WafAction::Deny => {
+            record(state);
+            note_deny(state, real_ip, now_ts, auto_ban);
+            log_request(
+                state,
+                client_ip,
+                method,
+                host,
+                path,
+                403,
+                started,
+                "-",
+                WafAction::Deny,
+                device,
+            );
+            Some((StatusCode::FORBIDDEN, Html(crate::pages::block_waf())).into_response())
+        }
+        WafAction::Challenge => {
+            // Clients that solved the proof-of-work carry a valid clearance cookie
+            // and pass; everyone else (incl. no-JS bots) gets the interstitial.
+            let now_ts = Utc::now().timestamp();
+            let cookie = headers.get("cookie").and_then(|v| v.to_str().ok());
+            if crate::challenge::has_clearance(cookie, &state.config.admin_token, now_ts) {
+                None
+            } else {
+                record(state);
+                log_request(
+                    state,
+                    client_ip,
+                    method,
+                    host,
+                    path,
+                    503,
+                    started,
+                    "-",
+                    WafAction::Challenge,
+                    device,
+                );
+                let html = crate::challenge::page(&state.config.admin_token, now_ts);
+                Some((StatusCode::SERVICE_UNAVAILABLE, axum::response::Html(html)).into_response())
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn log_request(
     state: &AppState,
@@ -1498,6 +1690,64 @@ fn record_event(
         path: path.to_string(),
         // Bound the stored UA so a pathological header can't bloat the JSONL.
         user_agent: user_agent.chars().take(200).collect(),
+        // Regex-rule events carry no semantic enrichment.
+        module: None,
+        risk: None,
+        location: None,
+        param: String::new(),
+        snippet: String::new(),
+        detail: None,
+        decision_trace: Some(format!(
+            "regex rule={} action={action:?}",
+            decision.matched_rule_id.as_deref().unwrap_or("default"),
+        )),
+        enforced: !matches!(action, WafAction::Allow),
+    };
+    state.waf_events.lock().record(event);
+}
+
+/// Record a security event from the **semantic** engine, carrying the enriched
+/// fields (module / risk / location / param / snippet). `enforced` distinguishes
+/// a real block/challenge from a monitor-mode or log-only observation.
+fn record_semantic_event(
+    state: &AppState,
+    client_ip: &str,
+    path: &str,
+    outcome: &crate::waf_semantic::SemanticOutcome,
+    user_agent: &str,
+) {
+    let d = &outcome.detection;
+    let event = SecurityEvent {
+        id: format!("ev-{}", Utc::now().timestamp_millis()),
+        time: Utc::now().to_rfc3339(),
+        client_ip: client_ip.to_string(),
+        // Human label: the fingerprint/detail. Module renders as its own typed
+        // badge in the UI, so it no longer needs baking into `rule`.
+        rule: d.detail.clone(),
+        action: outcome.action,
+        path: path.to_string(),
+        user_agent: user_agent.chars().take(200).collect(),
+        module: Some(d.module),
+        risk: Some(d.risk),
+        location: Some(d.location),
+        param: d.param.clone(),
+        snippet: d.snippet.clone(),
+        detail: Some(d.detail.clone()),
+        decision_trace: Some(format!(
+            "module={} risk={} location={} score={} action={:?} enforced={}{}",
+            d.module.key(),
+            d.risk.key(),
+            d.location.key(),
+            outcome.score,
+            outcome.action,
+            outcome.enforced,
+            if outcome.enforced {
+                ""
+            } else {
+                " (monitor/log)"
+            },
+        )),
+        enforced: outcome.enforced,
     };
     state.waf_events.lock().record(event);
 }
@@ -1505,6 +1755,51 @@ fn record_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hmap(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn smuggling_flags_ambiguous_framing() {
+        // CL + TE together, duplicate/conflicting CL, obfuscated TE → blocked.
+        for h in [
+            &[("content-length", "10"), ("transfer-encoding", "chunked")][..],
+            &[("content-length", "10"), ("content-length", "20")][..],
+            &[("content-length", "10, 20")][..],
+            &[("content-length", "abc")][..],
+            &[
+                ("transfer-encoding", "chunked"),
+                ("transfer-encoding", "identity"),
+            ][..],
+            &[("transfer-encoding", "chunked, x")][..], // chunked not final
+            &[("transfer-encoding", "xchunked")][..],   // obfuscated
+            &[("transfer-encoding", "identity")][..],   // not chunked-final
+        ] {
+            assert!(detect_smuggling(&hmap(h)).is_some(), "should flag: {h:?}");
+        }
+    }
+
+    #[test]
+    fn smuggling_passes_well_framed_requests() {
+        for h in [
+            &[("content-length", "42")][..],
+            &[("content-length", "0")][..],
+            &[("transfer-encoding", "chunked")][..],
+            &[("transfer-encoding", "gzip, chunked")][..],
+            &[("host", "example.com")][..],
+            &[][..],
+        ] {
+            assert!(detect_smuggling(&hmap(h)).is_none(), "should pass: {h:?}");
+        }
+    }
 
     fn upstream(strategy: LbStrategy, servers: &[(&str, u32, bool)]) -> Upstream {
         let mut u = Upstream {
@@ -1612,12 +1907,14 @@ mod tests {
             c.insert(header::CONTENT_TYPE, ct.parse().unwrap());
             assert!(is_inspectable_body(&c), "{ct} should be inspectable");
         }
-        for ct in [
-            "image/png",
-            "application/octet-stream",
-            "multipart/form-data; boundary=x",
-            "video/mp4",
-        ] {
+        // multipart/form-data is now inspectable: the semantic extractor reads
+        // text fields and skips file parts.
+        c.insert(
+            header::CONTENT_TYPE,
+            "multipart/form-data; boundary=x".parse().unwrap(),
+        );
+        assert!(is_inspectable_body(&c), "multipart should be inspectable");
+        for ct in ["image/png", "application/octet-stream", "video/mp4"] {
             c.insert(header::CONTENT_TYPE, ct.parse().unwrap());
             assert!(!is_inspectable_body(&c), "{ct} should be skipped");
         }

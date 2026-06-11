@@ -1,0 +1,15 @@
+[package]
+name = "fluxgate-waf-difftest"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Dev-only differential tests: the pure-Rust libinjection port vs the real C library (compiled from vendored BSD source)."
+
+[lib]
+doctest = false
+
+[dependencies]
+fluxgate-waf = { path = "../fluxgate-waf" }
+
+[build-dependencies]
+cc = "1"

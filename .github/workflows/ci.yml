@@ -24,8 +24,16 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets
+      # `--workspace` builds the `fluxgate-waf-difftest` crate too, which compiles
+      # the vendored libinjection C (via `cc`; the runner's gcc suffices) and runs
+      # the Rust-port-vs-C differential test — auto-catching port drift.
       - name: Test
         run: cargo test --workspace
+      # Non-gating perf canary: logs benign/attack ns-per-request so a gross
+      # semantic-engine regression shows up in CI history. Hard thresholds: P3.
+      - name: Bench smoke (non-gating)
+        continue-on-error: true
+        run: cargo test -p fluxgate-waf --release --test corpus -- --ignored --nocapture bench_semantic
 
   frontend:
     name: Web (typecheck · build)

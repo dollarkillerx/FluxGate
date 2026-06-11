@@ -1,0 +1,15 @@
+[package]
+name = "fluxgate-waf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FluxGate semantic WAF detection engine: parameter-level extraction, multi-layer decoding, and structure-aware SQLi/XSS/traversal/cmdi/SSRF detectors."
+
+[dependencies]
+fluxgate-core = { path = "../fluxgate-core" }
+serde = { workspace = true }
+parking_lot = { workspace = true }
+aho-corasick = { workspace = true }
+memchr = { workspace = true }
+arc-swap = "1.9.1"
+http = "1"

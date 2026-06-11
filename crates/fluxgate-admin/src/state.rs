@@ -139,6 +139,7 @@ impl AppState {
         });
         let waf = Arc::new(WafEngine::new(geo, asn));
         waf.rebuild(&store.waf_rules);
+        waf.rebuild_semantic(&store.waf_semantic);
         // Capture buffer paths before `config` is moved into the Arc.
         let log_path = config.log_path.clone();
         let event_path = config.event_path.clone();
@@ -195,6 +196,13 @@ pub struct Store {
     /// Admin credentials (never returned by `settings.get`).
     #[serde(default)]
     pub auth: AuthCreds,
+    /// Semantic WAF engine policy (modes / per-module actions / exceptions).
+    #[serde(default)]
+    pub waf_semantic: WafSemanticConfig,
+    /// Persisted-store schema version, used to run one-time migrations (e.g.
+    /// demoting regex rules superseded by the semantic engine). `0` = pre-semantic.
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 /// Admin login credentials. The password is stored only as an Argon2 hash.

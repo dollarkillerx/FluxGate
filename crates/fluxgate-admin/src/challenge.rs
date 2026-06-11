@@ -69,6 +69,22 @@ pub fn has_clearance(cookie_header: Option<&str>, secret: &str, now: i64) -> boo
     sha256_hex(&format!("{seed}:{nonce}")).starts_with(DIFFICULTY)
 }
 
+/// Mint a valid clearance `Cookie:` header value (`fg_clear=…`) for `now`, doing
+/// the same proof-of-work a browser would. Test-only: lets integration tests
+/// exercise the "already cleared" challenge path without a headless browser.
+#[cfg(test)]
+pub(crate) fn mint_clearance(secret: &str, now: i64) -> String {
+    let sig_str = sig(secret, now);
+    let seed = format!("{now}.{sig_str}");
+    let mut nonce: u64 = 0;
+    loop {
+        if sha256_hex(&format!("{seed}:{nonce}")).starts_with(DIFFICULTY) {
+            return format!("{COOKIE}={now}.{sig_str}.{nonce}");
+        }
+        nonce += 1;
+    }
+}
+
 /// Pull a cookie value by name out of a `Cookie:` header.
 fn cookie_value(header: &str, name: &str) -> Option<String> {
     header.split(';').find_map(|kv| {

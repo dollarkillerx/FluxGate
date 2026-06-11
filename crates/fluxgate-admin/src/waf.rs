@@ -3,10 +3,9 @@
 //! Design goals:
 //! * **Fast hot path.** Rules are *compiled once* (regexes built, CIDRs parsed,
 //!   priority-sorted) into an immutable `CompiledRuleSet` published behind an
-//!   `RwLock<Arc<…>>`. Evaluation clones one `Arc` (cheap) and iterates — no
-//!   per-request allocation, no per-request sort, no per-request regex
-//!   compilation or lock on the regex cache. Call [`WafEngine::rebuild`] whenever
-//!   the rule set changes.
+//!   `ArcSwap`. Evaluation reads it wait-free (one `Arc` clone, no lock) and
+//!   iterates — no per-request allocation, no per-request sort, no per-request
+//!   regex compilation. Call [`WafEngine::rebuild`] whenever the rule set changes.
 //! * **Hard to evade.** Path rules match the **path *and* query**, after
 //!   percent-decoding (defeats `%2e%2e%2f`-style encoded traversal / injection)
 //!   and `\`→`/` normalization. The `regex` crate guarantees linear-time
@@ -19,9 +18,13 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use arc_swap::ArcSwap;
+use axum::http::HeaderMap;
+use parking_lot::Mutex;
 use regex::Regex;
 
 use fluxgate_core::*;
@@ -33,8 +36,10 @@ pub struct WafContext<'a> {
     /// Request target — **path + query** (raw, still percent-encoded). The engine
     /// normalizes it before matching.
     pub path: &'a str,
-    /// Lowercased header name → value.
-    pub headers: &'a HashMap<String, String>,
+    /// The raw request headers. Names are matched case-insensitively (`HeaderMap`
+    /// already normalizes them); header **values** are lowercased at match time by
+    /// the `Header` matcher (only for the headers a rule references).
+    pub headers: &'a HeaderMap,
 }
 
 pub struct WafDecision {
@@ -188,9 +193,11 @@ fn compile_rule(r: &WafRule) -> CompiledRule {
 // ---------------------------------------------------------------------------
 
 pub struct WafEngine {
-    /// Compiled, priority-sorted rule set. Read lock-free-ish: a read clones the
-    /// `Arc` (cheap) and releases the lock before iterating.
-    compiled: RwLock<Arc<CompiledRuleSet>>,
+    /// Compiled, priority-sorted rule set. Published behind `ArcSwap` for
+    /// **wait-free** reads: the hot path uses `load()` (a guard — no lock and no
+    /// per-request `Arc` refcount bump, so no cross-core cache-line bounce), then
+    /// the engine iterates the snapshot.
+    compiled: ArcSwap<CompiledRuleSet>,
     /// Fixed-window rate counters keyed by `rule_id|client_ip` → (window_sec, count).
     rate: Mutex<HashMap<String, (u64, u32)>>,
     /// Per-rule hit counters (rule_id → count) — kept off the shared config Store.
@@ -200,6 +207,17 @@ pub struct WafEngine {
     geo: Option<maxminddb::Reader<Vec<u8>>>,
     /// Optional GeoLite2-ASN database. When absent, `is_datacenter` is always false.
     asn: Option<maxminddb::Reader<Vec<u8>>>,
+    /// Structure-aware semantic detection engine (12 modules: SQLi/XSS/traversal/…).
+    /// Runs *after* the regex rules — only when they reach the default `Allow`,
+    /// so an explicit allow/deny rule still short-circuits.
+    semantic: fluxgate_waf::SemanticEngine,
+    /// Published snapshot of the semantic policy (modes / per-module actions /
+    /// exceptions), read on the hot path to map detections to actions.
+    semantic_cfg: ArcSwap<WafSemanticConfig>,
+    /// Count of times a semantic detector panicked on adversarial input and was
+    /// caught (fail-open). A non-zero value is an alert: a payload found an
+    /// untested code path. Surfaced to the admin metrics.
+    detector_panics: AtomicU64,
 }
 
 impl WafEngine {
@@ -209,11 +227,44 @@ impl WafEngine {
         asn: Option<maxminddb::Reader<Vec<u8>>>,
     ) -> Self {
         Self {
-            compiled: RwLock::new(Arc::new(CompiledRuleSet::default())),
+            compiled: ArcSwap::from_pointee(CompiledRuleSet::default()),
             rate: Mutex::new(HashMap::new()),
             hits: Mutex::new(HashMap::new()),
             geo,
             asn,
+            semantic: fluxgate_waf::SemanticEngine::new(),
+            semantic_cfg: ArcSwap::from_pointee(WafSemanticConfig::default()),
+            detector_panics: AtomicU64::new(0),
+        }
+    }
+
+    /// How many times a semantic detector panicked and was caught (fail-open).
+    pub fn detector_panics(&self) -> u64 {
+        self.detector_panics.load(Ordering::Relaxed)
+    }
+
+    /// Run a semantic detector pass under a panic boundary. The detectors parse
+    /// fully attacker-controlled bytes; a bug there (e.g. the out-of-bounds slice
+    /// the audit found) must not abort the request worker. On panic we count it,
+    /// log loudly, and **fail open** (no detections) — availability over a
+    /// possible single-payload bypass, the commercial-WAF default. `parking_lot`
+    /// locks don't poison, so catching the unwind here is sound.
+    fn guard_detect(
+        &self,
+        what: &str,
+        f: impl FnOnce() -> Vec<fluxgate_waf::Detection>,
+    ) -> Vec<fluxgate_waf::Detection> {
+        match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+            Ok(v) => v,
+            Err(_) => {
+                self.detector_panics.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    target: "fluxgate::waf",
+                    detector = what,
+                    "semantic WAF detector panicked — failing open for this request"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -232,14 +283,14 @@ impl WafEngine {
         let rules: Vec<CompiledRule> = enabled.into_iter().map(compile_rule).collect();
         let has_body = rules.iter().any(|r| matches!(r.matcher, Matcher::Body(_)));
         let compiled = CompiledRuleSet { rules, has_body };
-        *self.compiled.write() = Arc::new(compiled);
+        self.compiled.store(Arc::new(compiled));
     }
 
     /// Evaluate `ctx` against the compiled rules (first match wins, ascending
     /// priority), falling back to `default`. Lock-free on the hot path apart from
     /// the rate/hit counters.
     pub fn evaluate(&self, default: WafAction, ctx: &WafContext, now_sec: u64) -> WafDecision {
-        let set = self.compiled.read().clone(); // cheap Arc clone, lock released
+        let set = self.compiled.load(); // wait-free read, no lock, no refcount bump
         let norm_path = normalize_path(ctx.path);
 
         for rule in &set.rules {
@@ -269,7 +320,7 @@ impl WafEngine {
     /// would double-count the stateful rate-limit counters. `raw` is the decoded
     /// body prefix; it is normalized once here (percent / `+` / `\`).
     pub fn evaluate_body(&self, raw: &str) -> Option<WafDecision> {
-        let set = self.compiled.read().clone(); // cheap Arc clone, lock released
+        let set = self.compiled.load(); // wait-free read, no lock, no refcount bump
         let norm = normalize_body(raw);
         for rule in &set.rules {
             if let Matcher::Body(re) = &rule.matcher {
@@ -290,7 +341,53 @@ impl WafEngine {
     /// this before reading a body prefix, so body inspection is truly zero-cost
     /// when no body rules are active.
     pub fn has_body_rules(&self) -> bool {
-        self.compiled.read().has_body
+        self.compiled.load().has_body
+    }
+
+    /// (Re)load the semantic-engine policy. Call after any `waf.semantic.*` or
+    /// `waf.exception.*` mutation (alongside [`rebuild`] for rule changes).
+    pub fn rebuild_semantic(&self, cfg: &WafSemanticConfig) {
+        self.semantic.rebuild(cfg);
+        self.semantic_cfg.store(Arc::new(cfg.clone()));
+    }
+
+    /// Whether the data plane should read a body prefix for *either* a regex body
+    /// rule or an enabled semantic module.
+    pub fn wants_body(&self) -> bool {
+        self.has_body_rules() || self.semantic.wants_body()
+    }
+
+    /// Run the semantic detectors over the request line + headers and map the
+    /// detections through the policy (exceptions, per-module risk actions,
+    /// monitor mode). `path` is the request path (without query) for exception
+    /// matching. Returns `None` when nothing fires.
+    pub fn semantic_evaluate(
+        &self,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        path: &str,
+        mode_override: Option<WafMode>,
+    ) -> Option<crate::waf_semantic::SemanticOutcome> {
+        let cfg = self.semantic_cfg.load();
+        let dets = self.guard_detect("analyze_request", || {
+            self.semantic.analyze_request(path_and_query, headers)
+        });
+        crate::waf_semantic::decide(&cfg, mode_override.unwrap_or(cfg.mode), path, dets)
+    }
+
+    /// Like [`semantic_evaluate`] but for a request **body** prefix.
+    pub fn semantic_evaluate_body(
+        &self,
+        content_type: Option<&str>,
+        body: &str,
+        path: &str,
+        mode_override: Option<WafMode>,
+    ) -> Option<crate::waf_semantic::SemanticOutcome> {
+        let cfg = self.semantic_cfg.load();
+        let dets = self.guard_detect("analyze_body", || {
+            self.semantic.analyze_body(content_type, body)
+        });
+        crate::waf_semantic::decide(&cfg, mode_override.unwrap_or(cfg.mode), path, dets)
     }
 
     /// Snapshot of per-rule hit counts, overlaid onto rules when listing them.
@@ -304,8 +401,17 @@ impl WafEngine {
             Matcher::Path(re) => re.is_match(norm_path),
             Matcher::Method(re) => re.is_match(ctx.method),
             Matcher::Header { name, re } => {
-                let value = ctx.headers.get(name).map(String::as_str).unwrap_or("");
-                re.is_match(value)
+                // Lowercase the value at match time (only for the headers a rule
+                // names) — preserves the prior behavior where the regex matched a
+                // lowercased value, without building a lowercased copy of *every*
+                // header on every request. `to_str` fails closed on non-UTF-8 bytes.
+                let value = ctx
+                    .headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                re.is_match(&value)
             }
             Matcher::RateLimit { id, prefix, limit } => {
                 self.rate_limited(id, prefix, *limit, ctx.client_ip, norm_path, now_sec)
@@ -429,84 +535,37 @@ const DATACENTER_ASNS: &[u32] = &[
 // Request-target normalization (anti-evasion)
 // ---------------------------------------------------------------------------
 
-/// Normalize a request target before matching: percent-decode (up to two passes
-/// to catch double-encoding) and fold `\` → `/`. This makes encoded payloads
-/// (`%2e%2e%2f`, `..%5c`, `%2553`) match the same rules as their decoded form —
-/// matching what the origin will actually interpret.
+/// Normalize a request target before matching, via the **one canonical decoder**
+/// shared with the semantic engine (`fluxgate_waf::decode`): percent (incl. the
+/// IIS `%uXXXX` form), HTML entities, and `\uXXXX`/`\xHH` escapes — to fixpoint —
+/// then fold `\` → `/`. So encoded payloads (`%2e%2e%2f`, `..%5c`, `&lt;`,
+/// `<`) match the same rules as their decoded form, and the regex and
+/// semantic engines can never disagree about what an input decodes to.
 fn normalize_path(raw: &str) -> Cow<'_, str> {
-    // Fast path: clean target (the overwhelming majority) — borrow, no allocation.
-    if !raw.contains('%') && !raw.contains('\\') {
-        return Cow::Borrowed(raw);
-    }
-    let mut cur = raw.to_string();
-    for _ in 0..2 {
-        let decoded = percent_decode(&cur);
-        if decoded == cur {
-            break;
-        }
-        cur = decoded;
-    }
-    if cur.contains('\\') {
-        cur = cur.replace('\\', "/");
-    }
-    Cow::Owned(cur)
+    let decoded = fluxgate_waf::decode::decode_value(raw, WafLocation::Path);
+    fold_backslash(decoded.text)
 }
 
 /// Normalize a request-body prefix before matching. Like [`normalize_path`] but
-/// also folds `+` → space (the `application/x-www-form-urlencoded` convention),
-/// so `id=1+or+1%3D1` matches the same rule as its decoded form.
+/// the `BodyForm` location also folds `+` → space (the form-urlencoded
+/// convention).
 ///
 /// This is **detection-only**: the bytes forwarded upstream are the original,
-/// unmodified body (see `PrefixBody` in `proxy.rs`). Over-decoding therefore can
+/// unmodified body (see `PrefixBody` in `proxy.rs`). Over-decoding can therefore
 /// only ever cause a false positive — never corrupt a proxied request — which is
 /// the safe direction for a WAF.
 fn normalize_body(raw: &str) -> Cow<'_, str> {
-    // Fast path: nothing to decode — borrow, no allocation.
-    if !raw.contains('%') && !raw.contains('+') && !raw.contains('\\') {
-        return Cow::Borrowed(raw);
-    }
-    let mut cur = if raw.contains('+') {
-        raw.replace('+', " ")
+    let decoded = fluxgate_waf::decode::decode_value(raw, WafLocation::BodyForm);
+    fold_backslash(decoded.text)
+}
+
+/// Fold `\` → `/` (a regex-engine concern the shared decoder leaves alone),
+/// borrowing through when there's no backslash.
+fn fold_backslash(v: Cow<'_, str>) -> Cow<'_, str> {
+    if v.contains('\\') {
+        Cow::Owned(v.replace('\\', "/"))
     } else {
-        raw.to_string()
-    };
-    for _ in 0..2 {
-        let decoded = percent_decode(&cur);
-        if decoded == cur {
-            break;
-        }
-        cur = decoded;
-    }
-    if cur.contains('\\') {
-        cur = cur.replace('\\', "/");
-    }
-    Cow::Owned(cur)
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
+        v
     }
 }
 
@@ -525,6 +584,7 @@ mod tests {
             priority: 10,
             enabled: true,
             hit_count: 0,
+            user_modified: false,
         }
     }
 
@@ -538,7 +598,7 @@ mod tests {
         ip: &'a str,
         method: &'a str,
         path: &'a str,
-        headers: &'a HashMap<String, String>,
+        headers: &'a HeaderMap,
     ) -> WafContext<'a> {
         WafContext {
             client_ip: ip,
@@ -546,6 +606,71 @@ mod tests {
             path,
             headers,
         }
+    }
+
+    /// What does turning the WAF *on* cost per request? This measures exactly the
+    /// work the data plane adds inside `if waf_enabled` — the regex `evaluate`
+    /// pass plus (when no regex rule matched) the semantic `semantic_evaluate`
+    /// pass — against a realistic OWASP-CRS ruleset with every semantic module on.
+    /// "WAF off" skips this block entirely, so the number below *is* the delta.
+    /// Run: `cargo test -p fluxgate-admin --release waf_overhead -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_waf_overhead() {
+        use std::time::Instant;
+        let rules = crate::waf_packs::pack_rules("owasp-crs").unwrap();
+        let nrules = rules.len();
+        let engine = WafEngine::new(None, None);
+        engine.rebuild(&rules);
+        engine.rebuild_semantic(&WafSemanticConfig::default());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64)".parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            "sid=abc123; theme=dark; lang=en".parse().unwrap(),
+        );
+        let now = 1_700_000_000u64;
+        let iters = 200_000u32;
+
+        // One full WAF pass: regex eval, then semantic eval iff no regex rule
+        // decided (the proxy short-circuits the same way).
+        let waf_pass = |pq: &str, path: &str| {
+            let c = ctx("203.0.113.7", "GET", pq, &headers);
+            let d = engine.evaluate(WafAction::Allow, &c, now);
+            if d.matched_rule_id.is_none() {
+                std::hint::black_box(engine.semantic_evaluate(pq, &headers, path, None));
+            }
+            std::hint::black_box(d.action);
+        };
+
+        let bench = |pq: &str, path: &str| -> f64 {
+            for _ in 0..20_000 {
+                waf_pass(pq, path);
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                waf_pass(std::hint::black_box(pq), std::hint::black_box(path));
+            }
+            t.elapsed().as_nanos() as f64 / iters as f64
+        };
+
+        let benign = bench(
+            "/api/v1/users?page=2&sort=name&filter=active&q=hello+world",
+            "/api/v1/users",
+        );
+        let attack = bench(
+            "/x?q=1%27%20UNION%20SELECT%20username,password%20FROM%20users--",
+            "/x",
+        );
+        println!(
+            "\nWAF cost per request (off = 0; CRS {nrules} regex rules + all 12 semantic modules):\n  \
+             benign GET (regex eval + semantic, no match): {benign:>7.0} ns/req\n  \
+             attack GET (SQLi — regex rule matches early):  {attack:>7.0} ns/req\n"
+        );
     }
 
     // IP/CIDR matching (v4 + v6) is tested in `iprange`; here we only cover the
@@ -564,8 +689,27 @@ mod tests {
     }
 
     #[test]
+    fn detector_panic_fails_open_and_is_counted() {
+        let engine = WafEngine::new(None, None);
+        // Silence the intentional panic's default stderr backtrace.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = engine.guard_detect("test", || panic!("boom"));
+        std::panic::set_hook(prev);
+        assert!(
+            out.is_empty(),
+            "a panicking detector must fail open (no detections)"
+        );
+        assert_eq!(engine.detector_panics(), 1, "the panic must be counted");
+        // A normal pass returns its value and leaves the counter untouched.
+        let ok = engine.guard_detect("test", Vec::new);
+        assert!(ok.is_empty());
+        assert_eq!(engine.detector_panics(), 1);
+    }
+
+    #[test]
     fn ip_rule_matches_v4_and_v6() {
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let engine = engine_with(&[
             rule(WafMatchType::Ip, "10.0.0.0/24", WafAction::Deny),
             rule(WafMatchType::Ip, "2400:cb00::/32", WafAction::Deny),
@@ -592,7 +736,7 @@ mod tests {
 
     #[test]
     fn path_regex_matches_then_default() {
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let engine = engine_with(&[rule(
             WafMatchType::Path,
             r"(?i)/etc/passwd",
@@ -612,7 +756,7 @@ mod tests {
 
     #[test]
     fn encoded_traversal_is_decoded_before_matching() {
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let engine = engine_with(&[rule(WafMatchType::Path, r"\.\./", WafAction::Deny)]);
         // Percent-encoded `../` must still be caught.
         let d = engine.evaluate(
@@ -631,8 +775,28 @@ mod tests {
     }
 
     #[test]
+    fn canonical_decoder_catches_entity_and_unicode_evasion() {
+        // The unified normalizer gives the regex engine the semantic engine's full
+        // decoding: HTML entities, `%uXXXX`, and `\xHH`/`\uXXXX` escapes now match.
+        let h = HeaderMap::new();
+        let engine = engine_with(&[rule(WafMatchType::Path, r"<script", WafAction::Deny)]);
+        for target in [
+            "/p?q=&lt;script",   // HTML entity
+            "/p?q=%3Cscript",    // percent
+            "/p?q=%u003Cscript", // IIS %uXXXX
+        ] {
+            let d = engine.evaluate(WafAction::Allow, &ctx("1.1.1.1", "GET", target, &h), 0);
+            assert_eq!(d.action, WafAction::Deny, "should decode + match: {target}");
+        }
+        // Body: `\x3c` unicode escape decodes to `<`.
+        let body_engine = engine_with(&[rule(WafMatchType::Body, r"<script", WafAction::Deny)]);
+        let d = body_engine.evaluate_body(r"q=\x3cscript");
+        assert_eq!(d.map(|d| d.action), Some(WafAction::Deny));
+    }
+
+    #[test]
     fn query_string_is_inspected() {
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let engine = engine_with(&[rule(
             WafMatchType::Path,
             r"(?i)union\s+select",
@@ -662,7 +826,7 @@ mod tests {
         rules.retain(|r| !matches!(r.match_type, WafMatchType::RateLimit));
         let engine = WafEngine::new(None, None);
         engine.rebuild(&rules);
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let iters = 1_000_000u32;
 
         // Benign request = worst case (every rule is evaluated, none matches).
@@ -728,7 +892,7 @@ mod tests {
 
     #[test]
     fn rate_limit_trips_after_threshold() {
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let engine = engine_with(&[rule(
             WafMatchType::RateLimit,
             "/@2r/s",
@@ -755,7 +919,7 @@ mod tests {
 
     #[test]
     fn priority_orders_first_match() {
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let mut low = rule(WafMatchType::Path, "/", WafAction::Challenge);
         low.id = "low".into();
         low.priority = 100;
@@ -789,14 +953,14 @@ mod tests {
     fn geo_never_matches_without_database() {
         // No DB loaded → geo rules are inert (never match).
         let engine = engine_with(&[rule(WafMatchType::Geo, "country in [KP]", WafAction::Deny)]);
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let d = engine.evaluate(WafAction::Allow, &ctx("175.45.176.1", "GET", "/", &h), 0);
         assert_eq!(d.action, WafAction::Allow);
     }
 
     #[test]
     fn disabled_rules_are_skipped() {
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let mut r = rule(WafMatchType::Path, "/", WafAction::Deny);
         r.enabled = false;
         let engine = engine_with(&[r]);
@@ -822,7 +986,7 @@ mod tests {
     fn body_rule_inert_in_request_line_pass() {
         // A Body rule must never fire during the normal (no-body) evaluate pass,
         // otherwise it would block on the request line and never see the body.
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let engine = engine_with(&[rule(WafMatchType::Body, r"(?i)evil", WafAction::Deny)]);
         let d = engine.evaluate(WafAction::Allow, &ctx("1.1.1.1", "POST", "/evil", &h), 0);
         assert_eq!(d.action, WafAction::Allow);
@@ -838,7 +1002,7 @@ mod tests {
 
     #[test]
     fn hit_counts_accumulate() {
-        let h = HashMap::new();
+        let h = HeaderMap::new();
         let engine = engine_with(&[rule(WafMatchType::Path, "/x", WafAction::Deny)]);
         for _ in 0..3 {
             engine.evaluate(WafAction::Allow, &ctx("1.1.1.1", "GET", "/x", &h), 0);

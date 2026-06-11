@@ -59,6 +59,7 @@ fn rule(
         priority,
         enabled: true,
         hit_count: 0,
+        user_modified: false,
     }
 }
 
@@ -69,7 +70,29 @@ fn rule(
 fn owasp_crs_pack() -> Vec<WafRule> {
     use WafAction::{Challenge, Deny};
     use WafMatchType::{Header, Path};
-    vec![
+    // Broad keyword rules now superseded by the semantic engine (SQLi/XSS/LFI/
+    // RCE/SSRF) ship **disabled** — they double-count and add false positives the
+    // structural detectors avoid. They remain importable/visible so an operator
+    // can re-enable them for defense-in-depth.
+    // crs-933-php and crs-944-java are now superseded too: the `php` (PHP-function
+    // injection) and `java` (OGNL/SpEL/reflection) semantic modules + the extended
+    // `deser` module cover their full vector set with lower false positives
+    // (validated by the corpus). They ship disabled but remain re-enableable.
+    const SUPERSEDED: &[&str] = &[
+        "crs-942-sqli-authbypass",
+        "crs-942-sqli-keywords",
+        "crs-942-sqli-functions",
+        "crs-942-sqli-operators",
+        "crs-941-xss-tags",
+        "crs-941-xss-events",
+        "crs-941-xss-uris",
+        "crs-930-lfi",
+        "crs-932-rce-unix",
+        "crs-ssrf-metadata",
+        "crs-933-php",
+        "crs-944-java",
+    ];
+    let mut rules = vec![
         // -- SQL injection (CRS 942) -------------------------------------------
         rule(
             "crs-942-sqli-authbypass",
@@ -240,7 +263,14 @@ fn owasp_crs_pack() -> Vec<WafRule> {
             Challenge,
             80,
         ),
-    ]
+    ];
+    for r in &mut rules {
+        if SUPERSEDED.contains(&r.id.as_str()) {
+            r.enabled = false;
+            r.description = format!("[superseded by semantic engine] {}", r.description);
+        }
+    }
+    rules
 }
 
 #[cfg(test)]

@@ -144,6 +144,10 @@ pub async fn handle_rpc(
                 if method.starts_with("waf.rule") {
                     state.waf.rebuild(&store.waf_rules);
                 }
+                // Recompile the semantic-engine policy when it changed.
+                if method.starts_with("waf.semantic") || method.starts_with("waf.exception") {
+                    state.waf.rebuild_semantic(&store.waf_semantic);
+                }
                 // Recompile the IP allow/block lists when they changed.
                 if method.starts_with("ip.") {
                     state
@@ -531,6 +535,7 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 path: input.path.unwrap_or_else(|| "/".into()),
                 upstream: input.upstream.unwrap_or_default(),
                 waf_enabled: input.waf_enabled.unwrap_or(waf_default),
+                waf_mode: parse_route_mode(input.waf_mode.as_deref()),
                 enabled: input.enabled.unwrap_or(true),
                 created_at: now.clone(),
                 updated_at: now,
@@ -561,6 +566,9 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             }
             if let Some(v) = input.waf_enabled {
                 r.waf_enabled = v;
+            }
+            if let Some(v) = &input.waf_mode {
+                r.waf_mode = parse_route_mode(Some(v));
             }
             if let Some(v) = input.enabled {
                 r.enabled = v;
@@ -728,6 +736,9 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 priority: input.priority.unwrap_or(50),
                 enabled: input.enabled.unwrap_or(true),
                 hit_count: 0,
+                // Operator-authored from the start — never a shipped default a
+                // migration should auto-demote.
+                user_modified: true,
             };
             store.waf_rules.insert(0, rule.clone());
             audit("waf.rule.create", &rule.id);
@@ -762,6 +773,9 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             if let Some(v) = input.enabled {
                 r.enabled = v;
             }
+            // The operator has now hand-tuned this rule: record provenance so a
+            // future schema migration won't auto-demote it as a shipped default.
+            r.user_modified = true;
             let out = r.clone();
             audit("waf.rule.update", &id);
             ok(out)
@@ -783,6 +797,60 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             let mut events = state.waf_events.lock().snapshot();
             events.truncate(limit);
             ok(events)
+        }
+
+        // ---- Semantic WAF engine (structure-aware detection) ----
+        "waf.semantic.get" => ok(store.waf_semantic.clone()),
+        "waf.semantic.update" => {
+            // Whole-config replace (the UI sends back the full edited config) —
+            // except `exceptions`, which are managed via `waf.exception.*`.
+            // Preserving them prevents a stale UI snapshot (or a concurrent admin
+            // session) from silently deleting exceptions created since it loaded.
+            let mut cfg: WafSemanticConfig = parse(params)?;
+            cfg.exceptions = store.waf_semantic.exceptions.clone();
+            store.waf_semantic = cfg;
+            audit("waf.semantic.update", "config");
+            ok(store.waf_semantic.clone())
+        }
+        "waf.exception.list" => ok(store.waf_semantic.exceptions.clone()),
+        "waf.exception.create" => {
+            let input: ExceptionInput = parse(params)?;
+            let path_prefix = input.path_prefix.unwrap_or_default();
+            let param = input.param.filter(|s| !s.is_empty());
+            // Reject an all-wildcard exception: with no module/path/param/location
+            // set it matches every detection and silently disables the entire
+            // engine. Require at least one scope field.
+            if input.module.is_none()
+                && path_prefix.is_empty()
+                && param.is_none()
+                && input.location.is_none()
+            {
+                return Err(RpcError::invalid_params(
+                    "exception must scope at least one of: module, path_prefix, param, location",
+                ));
+            }
+            let exc = WafException {
+                id: short_id("wx"),
+                enabled: input.enabled.unwrap_or(true),
+                module: input.module,
+                path_prefix,
+                param,
+                location: input.location,
+                note: input.note.unwrap_or_default(),
+            };
+            store.waf_semantic.exceptions.insert(0, exc.clone());
+            audit("waf.exception.create", &exc.id);
+            ok(exc)
+        }
+        "waf.exception.delete" => {
+            let p: IdParam = parse(params)?;
+            let before = store.waf_semantic.exceptions.len();
+            store.waf_semantic.exceptions.retain(|e| e.id != p.id);
+            if store.waf_semantic.exceptions.len() == before {
+                return Err(RpcError::not_found(format!("waf exception {}", p.id)));
+            }
+            audit("waf.exception.delete", &p.id);
+            ok(json!({ "success": true, "id": p.id }))
         }
 
         // ---- TLS (real keypair generation + PEM parsing) ----
@@ -1402,7 +1470,19 @@ struct RouteInput {
     path: Option<String>,
     upstream: Option<String>,
     waf_enabled: Option<bool>,
+    /// `"block"` / `"monitor"` / anything else (`"inherit"`) → inherit the global.
+    waf_mode: Option<String>,
     enabled: Option<bool>,
+}
+
+/// Map the UI's per-route WAF-mode string to a `WafMode` override (`None` =
+/// inherit the global semantic-engine mode).
+fn parse_route_mode(s: Option<&str>) -> Option<fluxgate_core::WafMode> {
+    match s {
+        Some("block") => Some(fluxgate_core::WafMode::Block),
+        Some("monitor") => Some(fluxgate_core::WafMode::Monitor),
+        _ => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1423,6 +1503,16 @@ struct WafRuleInput {
     action: Option<WafAction>,
     priority: Option<u32>,
     enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct ExceptionInput {
+    enabled: Option<bool>,
+    module: Option<WafModule>,
+    path_prefix: Option<String>,
+    param: Option<String>,
+    location: Option<WafLocation>,
+    note: Option<String>,
 }
 
 #[derive(Deserialize)]

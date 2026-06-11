@@ -27,10 +27,13 @@ web/dist/*
 # Persisted config + runtime artifacts (written at runtime)
 fluxgate-data.json
 fluxgate-data.json.tmp
+fluxgate-bans.json
+fluxgate-bans.json.tmp
 fluxgate-certs/
 fluxgate-access.log
 fluxgate-events.log
 fluxgate-traffic.json
+fluxgate-traffic.json.tmp
 fluxgate-geoip/
 *.mmdb
 

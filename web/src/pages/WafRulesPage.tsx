@@ -18,6 +18,7 @@ import { DataTable } from '@/components/ui/DataTable'
 import { StateView } from '@/components/ui/States'
 import { formatNumber } from '@/lib/utils'
 import { wafActionTone } from '@/lib/status'
+import { SemanticEngineCard } from './SemanticEngineCard'
 
 const col = createColumnHelper<WafRule>()
 
@@ -165,6 +166,10 @@ export function WafRulesPage() {
           </>
         }
       />
+
+      <div className="mb-5">
+        <SemanticEngineCard />
+      </div>
 
       <Card>
         <StateView loading={loading} error={error} data={data} onRetry={refetch}>

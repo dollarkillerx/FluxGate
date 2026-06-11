@@ -55,6 +55,8 @@ export interface Route {
   path: string
   upstream: string
   waf_enabled: boolean
+  /** Per-route semantic-engine mode override; null/absent = inherit the global. */
+  waf_mode?: WafMode | null
   enabled: boolean
   created_at: string
   updated_at: string
@@ -102,6 +104,54 @@ export interface SecurityEvent {
   action: WafAction
   path: string
   user_agent?: string
+  // Semantic-engine enrichment (null for legacy/regex-rule events).
+  module?: WafModule | null
+  risk?: WafRisk | null
+  location?: WafLocation | null
+  param?: string
+  snippet?: string
+  /** Detector-specific fingerprint / detail (e.g. `libinjection:1c`). */
+  detail?: string | null
+  /** Machine-readable record of why this decision was made. */
+  decision_trace?: string | null
+  enforced?: boolean
+}
+
+// -- Semantic WAF engine --------------------------------------------------
+export type WafModule = 'sqli' | 'xss' | 'traversal' | 'cmdi' | 'ssrf' | 'proto' | 'ssti' | 'nosql' | 'xxe' | 'deser' | 'php' | 'java'
+export type WafLocation = 'path' | 'query' | 'body_form' | 'body_json' | 'body_multipart' | 'cookie' | 'header'
+export type WafRisk = 'low' | 'medium' | 'high'
+export type WafMode = 'block' | 'monitor'
+export type RiskAction = 'block' | 'challenge' | 'log'
+
+export interface ModuleConfig {
+  enabled: boolean
+  high: RiskAction
+  medium: RiskAction
+  low: RiskAction
+}
+
+export interface WafException {
+  id: string
+  enabled: boolean
+  module?: WafModule | null
+  path_prefix: string
+  param?: string | null
+  location?: WafLocation | null
+  note: string
+}
+
+export interface AnomalyConfig {
+  enabled: boolean
+  threshold: number
+  action: RiskAction
+}
+
+export interface WafSemanticConfig {
+  mode: WafMode
+  modules: Record<string, ModuleConfig>
+  anomaly: AnomalyConfig
+  exceptions: WafException[]
 }
 
 export type CertStatus = 'valid' | 'expiring' | 'expired' | 'pending'

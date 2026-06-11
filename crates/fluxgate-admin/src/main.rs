@@ -41,6 +41,10 @@ mod tls;
 mod traffic;
 mod waf;
 mod waf_packs;
+mod waf_semantic;
+
+#[cfg(test)]
+mod integration_tests;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -294,12 +298,17 @@ fn build_router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
-/// Liveness probe. Always public.
-async fn health() -> Json<serde_json::Value> {
+/// Liveness probe. Always public. Also surfaces the WAF detector-panic counter:
+/// a non-zero value means a request hit an untested detector path and the engine
+/// failed open — an operational alert worth scraping.
+async fn health(
+    axum::extract::State(state): axum::extract::State<state::AppState>,
+) -> Json<serde_json::Value> {
     Json(json!({
         "status": "ok",
         "service": "fluxgate-admin",
         "version": env!("CARGO_PKG_VERSION"),
+        "waf_detector_panics": state.waf.detector_panics(),
     }))
 }
 
