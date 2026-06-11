@@ -271,8 +271,8 @@ export function RoutesPage() {
                               <td className="px-4 py-2.5"><Badge tone="info">{r.upstream}</Badge></td>
                               <td className="px-4 py-2.5">
                                 {r.waf_enabled ? <Badge tone="success" dot>{t('common.on')}</Badge> : <Badge tone="neutral">{t('common.off')}</Badge>}
-                                {r.waf_enabled && r.waf_mode === 'monitor' ? <Badge tone="warning" className="ml-1">monitor</Badge> : null}
-                                {r.waf_enabled && r.waf_mode === 'block' ? <Badge tone="neutral" className="ml-1">block</Badge> : null}
+                                {r.waf_enabled && r.waf_mode === 'monitor' ? <Badge tone="warning" className="ml-1">{t('routes.wafMode.badge.monitor')}</Badge> : null}
+                                {r.waf_enabled && r.waf_mode === 'block' ? <Badge tone="neutral" className="ml-1">{t('routes.wafMode.badge.block')}</Badge> : null}
                               </td>
                               <td className="px-4 py-2.5"><Toggle checked={r.enabled} onChange={(v) => toggleRoute(r, v)} aria-label="Toggle path" /></td>
                               <td className="px-4 py-2.5">
@@ -512,16 +512,13 @@ export function RoutesPage() {
               </label>
             </div>
             {routeForm.waf_enabled && (
-              <Field label="WAF mode (this route)">
+              <Field label={t('routes.wafMode')}>
                 <Select value={routeForm.waf_mode} onChange={(e) => setRouteForm({ ...routeForm, waf_mode: e.target.value })}>
-                  <option value="inherit">Inherit global</option>
-                  <option value="block">Block</option>
-                  <option value="monitor">Monitor (log only)</option>
+                  <option value="inherit">{t('routes.wafMode.inherit')}</option>
+                  <option value="block">{t('routes.wafMode.block')}</option>
+                  <option value="monitor">{t('routes.wafMode.monitor')}</option>
                 </Select>
-                <p className="mt-1 text-xs text-slate-400">
-                  Override the semantic engine's posture for this path — e.g. Monitor a new route
-                  while the rest of the site keeps blocking. Explicit regex rules still enforce.
-                </p>
+                <p className="mt-1 text-xs text-slate-400">{t('routes.wafMode.help')}</p>
               </Field>
             )}
           </div>

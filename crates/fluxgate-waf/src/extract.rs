@@ -137,12 +137,37 @@ pub fn extract_body<'a>(content_type: Option<&str>, body: &'a str) -> Vec<Param<
         extract_json(body, &mut out);
     } else if starts("multipart/form-data") {
         extract_multipart(ct, body, &mut out);
-    } else {
-        // text/*, xml, or unknown: scan the whole prefix as one value.
+    } else if !looks_binary(body) {
+        // text/*, xml, or unknown: scan the whole prefix as one value — but only
+        // when it actually looks like text. A raw binary upload (image, archive,
+        // octet-stream, a chunked file PUT) legitimately carries NUL and control
+        // bytes, which the text detectors (esp. `proto`'s NUL check) would only
+        // false-positive on. Structured text fields (query / header / JSON / form /
+        // multipart) are extracted above and keep full NUL detection.
         out.push(Param::borrowed(WafLocation::BodyForm, "body", body));
     }
 
     out
+}
+
+/// Heuristic: does this raw body look like a binary upload (image, archive,
+/// octet-stream) rather than text? The proxy reads the body prefix via
+/// `from_utf8_lossy`, so non-UTF-8 file bytes surface as `U+FFFD` replacement
+/// chars — a strong binary tell — alongside NUL and other C0 controls. A real
+/// text body has effectively none of these, so a high ratio means binary and the
+/// catch-all raw-body value is skipped (vs. a stray `file\0.jpg`-style value,
+/// which stays text and is still flagged). Also used by the data plane to skip
+/// the regex body layer on binary uploads.
+pub fn looks_binary(body: &str) -> bool {
+    let mut total = 0usize;
+    let mut bin = 0usize;
+    for c in body.chars().take(512) {
+        total += 1;
+        if c == '\0' || c == '\u{FFFD}' || (c.is_control() && !matches!(c, '\t' | '\r' | '\n')) {
+            bin += 1;
+        }
+    }
+    total > 0 && bin * 100 / total >= 15
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -564,5 +589,26 @@ mod tests {
         let nv = names_values(&p);
         assert!(nv.contains(&(WafLocation::BodyForm, "u".into(), "alice".into())));
         assert!(nv.contains(&(WafLocation::BodyForm, "p".into(), "secret".into())));
+    }
+
+    #[test]
+    fn binary_upload_body_skipped() {
+        // A raw PNG chunk PUT with no content-type, read as from_utf8_lossy: the
+        // magic + pixel bytes become NUL + U+FFFD. The catch-all must skip it so
+        // `proto`'s NUL check never false-positives on a legitimate file upload.
+        let png = String::from_utf8_lossy(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x04\x00\x00\xc4\x82\x9c\x08\x02\x00\x00\x00").into_owned();
+        assert!(
+            extract_body(None, &png).is_empty(),
+            "binary body must be skipped"
+        );
+
+        // A genuine text body with no content-type is still inspected.
+        let text = extract_body(None, "hello world this is plain text");
+        assert_eq!(text.len(), 1);
+
+        // A short text value with a stray NUL stays text (low binary ratio) — the
+        // null-byte injection case is preserved, not masked by the binary skip.
+        let injected = extract_body(None, "file\0.jpg");
+        assert_eq!(injected.len(), 1);
     }
 }

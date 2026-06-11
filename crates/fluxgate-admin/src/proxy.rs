@@ -670,11 +670,16 @@ async fn proxy_handler(
                 let is_multipart = ct
                     .map(|c| c.to_ascii_lowercase().starts_with("multipart/form-data"))
                     .unwrap_or(false);
-                let regex_decision = if is_multipart {
-                    None
-                } else {
-                    state.waf.evaluate_body(&inspect)
-                };
+                // Also skip text-oriented body regexes on a raw binary upload (an
+                // image / archive / octet-stream / chunked file PUT with no usable
+                // content-type): its NUL + replacement bytes would only
+                // false-positive. The semantic layer skips it for the same reason.
+                let regex_decision =
+                    if is_multipart || fluxgate_waf::extract::looks_binary(&inspect) {
+                        None
+                    } else {
+                        state.waf.evaluate_body(&inspect)
+                    };
                 if let Some(decision) = &regex_decision {
                     if let Some(resp) = enforce_waf_action(
                         &state,

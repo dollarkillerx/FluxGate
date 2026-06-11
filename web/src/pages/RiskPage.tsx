@@ -39,14 +39,15 @@ export function RiskPage() {
         note: `accepted FP from risk event (${e.rule})`,
       })
       setFpState((s) => ({ ...s, [e.id]: 'done' }))
-      toast.success('Exception added', `${e.module} on ${e.path}${e.param ? ` [${e.param}]` : ''} is now allowed`)
+      const scope = `${e.module} · ${e.path}${e.param ? ` [${e.param}]` : ''}`
+      toast.success(t('risk.fpAdded'), t('risk.fpAddedBody', { scope }))
     } catch (err: any) {
       setFpState((s) => {
         const n = { ...s }
         delete n[e.id]
         return n
       })
-      toast.error('Could not add exception', err?.message)
+      toast.error(t('risk.fpFail'), err?.message)
     }
   }
 
@@ -204,9 +205,9 @@ export function RiskPage() {
                               loading={fpState[e.id] === 'pending'}
                               disabled={fpState[e.id] === 'done'}
                               onClick={() => acceptFp(e)}
-                              title={`Accept as false positive — allow ${e.module} on ${e.path}${e.param ? ` [${e.param}]` : ''}`}
+                              title={`${t('risk.acceptFp')} — ${e.module} · ${e.path}${e.param ? ` [${e.param}]` : ''}`}
                             >
-                              {fpState[e.id] === 'done' ? 'Accepted' : 'Accept FP'}
+                              {fpState[e.id] === 'done' ? t('risk.accepted') : t('risk.acceptFp')}
                             </Button>
                           ) : null}
                           <span className="text-xs text-slate-400">{timeAgo(e.time)}</span>
@@ -220,7 +221,7 @@ export function RiskPage() {
                       ) : null}
                       {e.decision_trace ? (
                         <p className="mt-0.5 truncate text-[11px] text-slate-400" title={e.decision_trace}>
-                          <span className="text-slate-500 dark:text-slate-500">why:</span> {e.decision_trace}
+                          <span className="text-slate-500 dark:text-slate-500">{t('risk.why')}</span> {e.decision_trace}
                         </p>
                       ) : null}
                       {e.user_agent ? (
