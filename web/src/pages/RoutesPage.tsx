@@ -63,6 +63,8 @@ interface RouteForm {
   waf_enabled: boolean
   /** 'inherit' | 'block' | 'monitor' — per-route semantic-engine mode. */
   waf_mode: string
+  /** nginx-style URL rewrite: strip the matched route prefix before forwarding. */
+  strip_prefix: boolean
   enabled: boolean
 }
 
@@ -237,7 +239,7 @@ export function RoutesPage() {
                       </button>
                       <div className="flex items-center gap-1">
                         <Toggle checked={site.enabled} onChange={(v) => toggleSite(site, v)} aria-label="Toggle site" />
-                        <Button variant="ghost" size="sm" icon={<Plus size={14} />} onClick={() => { setExpanded((e) => ({ ...e, [site.id]: true })); setRouteForm({ site_id: site.id, path: '/', upstream: upstreams.data?.[0]?.name ?? '', waf_enabled: site.waf_enabled, waf_mode: 'inherit', enabled: true }) }}>
+                        <Button variant="ghost" size="sm" icon={<Plus size={14} />} onClick={() => { setExpanded((e) => ({ ...e, [site.id]: true })); setRouteForm({ site_id: site.id, path: '/', upstream: upstreams.data?.[0]?.name ?? '', waf_enabled: site.waf_enabled, waf_mode: 'inherit', strip_prefix: false, enabled: true }) }}>
                           {t('sites.addPath')}
                         </Button>
                         <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => { setAdvanced(false); setSiteForm({ id: site.id, name: site.name, host: site.host, tls_enabled: site.tls_enabled, cert_id: site.cert_id ?? '', https_redirect: site.https_redirect ?? false, waf_enabled: site.waf_enabled, max_body_mb: site.max_body_mb ?? 500, upstream_timeout_secs: site.upstream_timeout_secs ?? 120, block_crawler_ua: site.block_crawler_ua ?? false, browser_only: site.browser_only ?? false, rewrite_robots: site.rewrite_robots ?? false, redirects: site.redirects ?? [], blocked_countries: site.blocked_countries ?? [], block_datacenter: site.block_datacenter ?? false, cloudflare_only: site.cloudflare_only ?? false, enabled: site.enabled }) }} aria-label={t('common.edit')} />
@@ -278,7 +280,7 @@ export function RoutesPage() {
                               <td className="px-4 py-2.5">
                                 <div className="flex justify-end gap-1">
                                   <Button variant="ghost" size="sm" icon={<Activity size={14} />} onClick={() => openAnalytics(site.host, r.path)} aria-label={t('routes.analyze')} />
-                                  <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => setRouteForm({ id: r.id, site_id: r.site_id, path: r.path, upstream: r.upstream, waf_enabled: r.waf_enabled, waf_mode: r.waf_mode ?? 'inherit', enabled: r.enabled })} aria-label={t('common.edit')} />
+                                  <Button variant="ghost" size="sm" icon={<Pencil size={14} />} onClick={() => setRouteForm({ id: r.id, site_id: r.site_id, path: r.path, upstream: r.upstream, waf_enabled: r.waf_enabled, waf_mode: r.waf_mode ?? 'inherit', strip_prefix: r.strip_prefix ?? false, enabled: r.enabled })} aria-label={t('common.edit')} />
                                   <Button variant="ghost" size="sm" icon={<Trash2 size={14} className="text-red-500" />} onClick={() => setRouteToDelete(r)} aria-label={t('common.delete')} />
                                 </div>
                               </td>
@@ -506,6 +508,10 @@ export function RoutesPage() {
             <div className="flex flex-wrap gap-6 pt-1">
               <label className="flex items-center gap-2.5 text-sm text-slate-700 dark:text-slate-200">
                 <Toggle checked={routeForm.waf_enabled} onChange={(v) => setRouteForm({ ...routeForm, waf_enabled: v })} aria-label="WAF" /> {t('routes.enableWaf')}
+              </label>
+              <label className="flex items-center gap-2.5 text-sm text-slate-700 dark:text-slate-200">
+                <Toggle checked={routeForm.strip_prefix} onChange={(v) => setRouteForm({ ...routeForm, strip_prefix: v })} aria-label="URL rewrite" />
+                <span>{t('routes.stripPrefix')}<span className="ml-1 text-xs text-slate-400">{t('routes.stripPrefix.hint')}</span></span>
               </label>
               <label className="flex items-center gap-2.5 text-sm text-slate-700 dark:text-slate-200">
                 <Toggle checked={routeForm.enabled} onChange={(v) => setRouteForm({ ...routeForm, enabled: v })} aria-label="Enabled" /> {t('common.active')}

@@ -57,6 +57,8 @@ export interface Route {
   waf_enabled: boolean
   /** Per-route semantic-engine mode override; null/absent = inherit the global. */
   waf_mode?: WafMode | null
+  /** nginx-style URL rewrite: strip the matched route prefix before forwarding. */
+  strip_prefix?: boolean
   enabled: boolean
   created_at: string
   updated_at: string
@@ -79,6 +81,8 @@ export interface Upstream {
   servers: UpstreamServer[]
   healthy_servers: number
   status: UpstreamStatus
+  /** Connect to the backend over TLS (https://); cert not verified (nginx-style). */
+  tls?: boolean
 }
 
 export type WafAction = 'allow' | 'deny' | 'challenge'

@@ -536,6 +536,7 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
                 upstream: input.upstream.unwrap_or_default(),
                 waf_enabled: input.waf_enabled.unwrap_or(waf_default),
                 waf_mode: parse_route_mode(input.waf_mode.as_deref()),
+                strip_prefix: input.strip_prefix.unwrap_or(false),
                 enabled: input.enabled.unwrap_or(true),
                 created_at: now.clone(),
                 updated_at: now,
@@ -569,6 +570,9 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             }
             if let Some(v) = &input.waf_mode {
                 r.waf_mode = parse_route_mode(Some(v));
+            }
+            if let Some(v) = input.strip_prefix {
+                r.strip_prefix = v;
             }
             if let Some(v) = input.enabled {
                 r.enabled = v;
@@ -604,13 +608,18 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
         }
         "upstream.create" => {
             let input: UpstreamInput = parse(params)?;
+            let mut servers = input.servers.unwrap_or_default();
+            for s in &mut servers {
+                s.address = normalize_addr(&s.address);
+            }
             let mut up = Upstream {
                 id: short_id("up"),
                 name: input.name.unwrap_or_else(|| "new-upstream".into()),
                 strategy: input.strategy.unwrap_or(LbStrategy::RoundRobin),
-                servers: input.servers.unwrap_or_default(),
+                servers,
                 healthy_servers: 0,
                 status: UpstreamStatus::Down,
+                tls: input.tls.unwrap_or(false),
             };
             // Probe immediately so the returned/persisted status reflects reality
             // right away instead of trusting the client-supplied `healthy` flag
@@ -634,8 +643,14 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
             if let Some(v) = input.strategy {
                 u.strategy = v;
             }
-            if let Some(v) = input.servers {
+            if let Some(mut v) = input.servers {
+                for s in &mut v {
+                    s.address = normalize_addr(&s.address);
+                }
                 u.servers = v;
+            }
+            if let Some(v) = input.tls {
+                u.tls = v;
             }
             // Re-probe on every edit so an added/changed node's health is accurate
             // immediately rather than after the next background sweep.
@@ -1472,6 +1487,8 @@ struct RouteInput {
     waf_enabled: Option<bool>,
     /// `"block"` / `"monitor"` / anything else (`"inherit"`) → inherit the global.
     waf_mode: Option<String>,
+    /// nginx-style URL rewrite: strip the matched route prefix before forwarding.
+    strip_prefix: Option<bool>,
     enabled: Option<bool>,
 }
 
@@ -1491,6 +1508,22 @@ struct UpstreamInput {
     name: Option<String>,
     strategy: Option<LbStrategy>,
     servers: Option<Vec<UpstreamServer>>,
+    /// Connect to this upstream over TLS (`https://`). See `Upstream.tls`.
+    tls: Option<bool>,
+}
+
+/// Normalise an upstream server address to bare `host:port`: drop any `http(s)://`
+/// scheme (the scheme is decided by the upstream's `tls` flag) and anything from the
+/// first `/` onward — a stray path would otherwise be concatenated onto the request
+/// path at forward time and corrupt routing (e.g. `127.0.0.1:7880/twirp` →
+/// `/twirp/twirp/…`).
+fn normalize_addr(addr: &str) -> String {
+    let a = addr.trim();
+    let a = a
+        .strip_prefix("https://")
+        .or_else(|| a.strip_prefix("http://"))
+        .unwrap_or(a);
+    a.split('/').next().unwrap_or(a).trim().to_string()
 }
 
 #[derive(Deserialize)]

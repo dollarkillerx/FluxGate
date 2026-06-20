@@ -507,6 +507,7 @@ dependencies = [
  "fluxgate-waf",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "instant-acme",
  "jsonwebtoken",

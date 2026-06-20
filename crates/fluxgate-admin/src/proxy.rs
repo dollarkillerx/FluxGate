@@ -42,13 +42,69 @@ use fluxgate_core::*;
 use crate::state::AppState;
 use crate::waf::WafContext;
 
-/// Hyper client used to reach upstreams (HTTP/1, with upgrade support).
-pub type ProxyClient = Client<HttpConnector, Body>;
+/// Hyper client used to reach upstreams (HTTP/1, with upgrade support). The
+/// `HttpsConnector` dispatches on the request URL scheme: `http://` upstreams use
+/// the plain inner connector, `https://` upstreams (per-upstream `tls` flag) go
+/// over TLS — so both, and WS/WSS, run through one client.
+pub type ProxyClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
+
+/// Upstream-TLS certificate verifier that accepts any cert. A reverse proxy's leg
+/// to its own backends is a trusted hop, and those backends commonly serve
+/// self-signed/internal certs — so, like nginx's default `proxy_ssl_verify off`,
+/// we don't verify. (This governs only the proxy→upstream connection, never the
+/// client→FluxGate TLS, which uses real certs.)
+#[derive(Debug)]
+struct NoUpstreamCertVerify(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for NoUpstreamCertVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
 
 pub fn build_client() -> ProxyClient {
-    let mut connector = HttpConnector::new();
-    connector.set_nodelay(true);
-    Client::builder(TokioExecutor::new()).build(connector)
+    let mut http = HttpConnector::new();
+    http.set_nodelay(true);
+    http.enforce_http(false); // let https:// URLs reach the TLS layer
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let tls = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("rustls default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(NoUpstreamCertVerify(provider)))
+        .with_no_client_auth();
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http);
+    Client::builder(TokioExecutor::new()).build(https)
 }
 
 /// Hop-by-hop headers stripped on normal (non-upgrade) forwarding.
@@ -316,6 +372,9 @@ async fn proxy_handler(
     let Target {
         upstream: upstream_name,
         address,
+        tls: upstream_tls,
+        strip_prefix,
+        route_path,
         waf_enabled,
         default_waf,
         waf_mode,
@@ -767,7 +826,17 @@ async fn proxy_handler(
     };
 
     // --- Build the upstream request -----------------------------------------
-    let url = format!("http://{address}{path_and_query}");
+    // For `strip_prefix` routes, rewrite the forwarded path only — never mutate the
+    // shared `path_and_query`, which WAF inspection and access logging still read.
+    let stripped;
+    let forward_pq: &str = if strip_prefix {
+        stripped = rewrite_strip_prefix(&path_and_query, &route_path);
+        &stripped
+    } else {
+        &path_and_query
+    };
+    let scheme = if upstream_tls { "https" } else { "http" };
+    let url = format!("{scheme}://{address}{forward_pq}");
     let mut builder = hyper::Request::builder().method(parts.method).uri(&url);
     for (name, value) in &parts.headers {
         if forward_request_header(name, is_ws) {
@@ -972,6 +1041,29 @@ fn redirect_matches(rule_path: &str, path: &str) -> bool {
     }
 }
 
+/// nginx-style prefix strip for `strip_prefix` routes: remove the matched
+/// `route_path` from the front of the request path (the query string is
+/// preserved). An empty or slash-less remainder is normalised to start with `/`
+/// (so route `/api` → request `/api` forwards as `/`, `/api/x` as `/x`).
+fn rewrite_strip_prefix(path_and_query: &str, route_path: &str) -> String {
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_and_query, None),
+    };
+    let rest = path.strip_prefix(route_path).unwrap_or(path);
+    let rest = if rest.is_empty() {
+        "/".to_string()
+    } else if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        format!("/{rest}")
+    };
+    match query {
+        Some(q) => format!("{rest}?{q}"),
+        None => rest,
+    }
+}
+
 /// Everything `pick_target` resolves for a forwardable request — the upstream
 /// node plus the site/route settings the handler needs. Read under one store
 /// lock so the hot path doesn't re-lock. Add new site settings here (and in
@@ -979,6 +1071,12 @@ fn redirect_matches(rule_path: &str, path: &str) -> bool {
 struct Target {
     upstream: String,
     address: String,
+    /// Connect to this upstream over TLS (`https://`). See `Upstream.tls`.
+    tls: bool,
+    /// nginx-style URL rewrite (strip the matched route prefix before forwarding)
+    /// and the matched route `path` to strip. See `Route.strip_prefix`.
+    strip_prefix: bool,
+    route_path: String,
     waf_enabled: bool,
     default_waf: WafAction,
     /// Per-route semantic-engine mode override (`None` = inherit the global mode).
@@ -1041,6 +1139,8 @@ fn pick_target(
     };
     let waf_enabled = route.waf_enabled;
     let waf_mode = route.waf_mode;
+    let strip_prefix = route.strip_prefix;
+    let route_path = route.path.clone();
     let default_waf = store.settings.default_waf_action;
     let max_body_mb = site.max_body_mb;
     let upstream_timeout_secs = site.upstream_timeout_secs;
@@ -1060,6 +1160,9 @@ fn pick_target(
         Some(address) => RouteOutcome::Found(Target {
             upstream: upstream.name.clone(),
             address,
+            tls: upstream.tls,
+            strip_prefix,
+            route_path,
             waf_enabled,
             default_waf,
             waf_mode,

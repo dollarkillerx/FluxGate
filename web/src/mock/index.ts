@@ -329,6 +329,7 @@ const handlers: Record<string, (p: Params) => unknown> = {
       id: sid('rt'), site_id: p.site_id ?? '', name: p.name ?? '', path: p.path ?? '/',
       upstream: p.upstream ?? '', waf_enabled: p.waf_enabled ?? true,
       waf_mode: p.waf_mode === 'block' || p.waf_mode === 'monitor' ? p.waf_mode : null,
+      strip_prefix: p.strip_prefix ?? false,
       enabled: p.enabled ?? true, created_at: now(), updated_at: now(),
     }
     routes.unshift(route)
@@ -336,7 +337,7 @@ const handlers: Record<string, (p: Params) => unknown> = {
   },
   'route.update': (p) => {
     const route = find(routes, p.id, 'route')
-    Object.assign(route, pick(p, ['site_id', 'name', 'path', 'upstream', 'waf_enabled', 'enabled']))
+    Object.assign(route, pick(p, ['site_id', 'name', 'path', 'upstream', 'waf_enabled', 'strip_prefix', 'enabled']))
     if (p.waf_mode !== undefined) route.waf_mode = p.waf_mode === 'block' || p.waf_mode === 'monitor' ? p.waf_mode : null
     route.updated_at = now()
     return route
@@ -348,14 +349,14 @@ const handlers: Record<string, (p: Params) => unknown> = {
   'upstream.list': () => upstreams,
   'upstream.get': (p) => find(upstreams, p.id, 'upstream'),
   'upstream.create': (p) => {
-    const up: Upstream = { id: sid('up'), name: p.name ?? 'new-upstream', strategy: p.strategy ?? 'round_robin', servers: p.servers ?? [], healthy_servers: 0, status: 'down' }
+    const up: Upstream = { id: sid('up'), name: p.name ?? 'new-upstream', strategy: p.strategy ?? 'round_robin', servers: p.servers ?? [], healthy_servers: 0, status: 'down', tls: p.tls ?? false }
     recompute(up)
     upstreams.unshift(up)
     return up
   },
   'upstream.update': (p) => {
     const up = find(upstreams, p.id, 'upstream')
-    Object.assign(up, pick(p, ['name', 'strategy', 'servers']))
+    Object.assign(up, pick(p, ['name', 'strategy', 'servers', 'tls']))
     recompute(up)
     return up
   },

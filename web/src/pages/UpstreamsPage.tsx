@@ -13,6 +13,7 @@ import { Button } from '@/components/ui/Button'
 import { Modal } from '@/components/ui/Modal'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { Field, Input, Select } from '@/components/ui/Field'
+import { Toggle } from '@/components/ui/Toggle'
 import { DataTable } from '@/components/ui/DataTable'
 import { StateView } from '@/components/ui/States'
 import { upstreamTone } from '@/lib/status'
@@ -31,10 +32,12 @@ interface UpstreamForm {
   name: string
   strategy: LbStrategy
   servers: ServerRow[]
+  /** Connect to the backend over TLS (https://); cert not verified (nginx-style). */
+  tls: boolean
 }
 
 const blankRow = (): ServerRow => ({ address: '', weight: 1 })
-const emptyForm: UpstreamForm = { name: '', strategy: 'round_robin', servers: [blankRow()] }
+const emptyForm: UpstreamForm = { name: '', strategy: 'round_robin', servers: [blankRow()], tls: false }
 
 export function UpstreamsPage() {
   const toast = useToast()
@@ -57,6 +60,7 @@ export function UpstreamsPage() {
       name: u.name,
       strategy: u.strategy,
       servers: u.servers.length ? u.servers.map((s) => ({ address: s.address, weight: s.weight })) : [blankRow()],
+      tls: u.tls ?? false,
     })
     setFormOpen(true)
   }
@@ -92,7 +96,7 @@ export function UpstreamsPage() {
           ? { ...s, healthy: prev.healthy, latency_ms: prev.latency_ms }
           : { ...s, healthy: true, latency_ms: 0 }
       })
-      const payload = { id: form.id, name: form.name, strategy: form.strategy, servers }
+      const payload = { id: form.id, name: form.name, strategy: form.strategy, servers, tls: form.tls }
       await rpc.call(form.id ? 'upstream.update' : 'upstream.create', payload)
       toast.success(form.id ? t('upstreams.updated') : t('upstreams.created'), form.name)
       setFormOpen(false)
@@ -231,6 +235,10 @@ export function UpstreamsPage() {
               ))}
             </Select>
           </Field>
+          <label className="flex items-center gap-2.5 text-sm text-slate-700 dark:text-slate-200">
+            <Toggle checked={form.tls} onChange={(v) => setForm({ ...form, tls: v })} aria-label="TLS" />
+            <span>{t('upstreams.tls')}<span className="ml-1 text-xs text-slate-400">{t('upstreams.tls.hint')}</span></span>
+          </label>
           <Field label={t('upstreams.field.servers')} hint={t('upstreams.serversHint')}>
             <div className="space-y-2">
               <div className="flex items-center gap-2 px-0.5 text-[11px] font-medium uppercase tracking-wide text-slate-400 dark:text-slate-500">

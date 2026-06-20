@@ -109,6 +109,12 @@ pub struct Route {
     /// Monitor. Governs the semantic engine only (regex rules always enforce).
     #[serde(default)]
     pub waf_mode: Option<WafMode>,
+    /// nginx-style URL rewrite: when `true`, the matched route `path` prefix is
+    /// stripped from the request before forwarding (e.g. route `/api` →
+    /// `/api/x` is sent upstream as `/x`). `false` (default) = pass the full path
+    /// through unchanged. `#[serde(default)]` keeps old configs backward-compatible.
+    #[serde(default)]
+    pub strip_prefix: bool,
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -151,6 +157,12 @@ pub struct Upstream {
     pub servers: Vec<UpstreamServer>,
     pub healthy_servers: u32,
     pub status: UpstreamStatus,
+    /// Connect to the upstream over TLS (`https://`) instead of plaintext
+    /// (`http://`). Like nginx `proxy_pass https://…`, the upstream certificate is
+    /// NOT verified (the proxy↔backend hop is a trusted network; matches nginx's
+    /// default `proxy_ssl_verify off`). `#[serde(default)]` keeps old configs valid.
+    #[serde(default)]
+    pub tls: bool,
 }
 
 impl Upstream {
