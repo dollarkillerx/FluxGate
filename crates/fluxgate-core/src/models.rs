@@ -121,6 +121,40 @@ pub struct Route {
 }
 
 // ---------------------------------------------------------------------------
+// L4 (TLS-SNI passthrough) routes
+// ---------------------------------------------------------------------------
+
+/// An L4 route: it matches the TLS ClientHello SNI on the shared :443 ingress and
+/// forwards the byte stream VERBATIM to an origin (`host:port`), never terminating
+/// TLS. Use it for TLS-based backends (VLESS-Reality, AnyTLS, gRPC/TLS, any HTTPS
+/// origin you want passed through unchanged). When an SNI matches no L4 route the
+/// connection falls through to the normal L7 HTTPS proxy, so L4 and L7 coexist on
+/// :443. Load-balanced across `origins` by `strategy`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L4Route {
+    pub id: String,
+    pub name: String,
+    /// SNI names this route claims: exact (`a.example.com`) or a one-label
+    /// wildcard (`*.example.com`).
+    pub server_names: Vec<String>,
+    /// Origin `host:port` TCP targets; load-balanced by `strategy`.
+    pub origins: Vec<String>,
+    #[serde(default = "default_round_robin")]
+    pub strategy: LbStrategy,
+    /// Origin connect timeout in seconds; `0` → default (5s).
+    #[serde(default)]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn default_round_robin() -> LbStrategy {
+    LbStrategy::RoundRobin
+}
+
+// ---------------------------------------------------------------------------
 // Upstreams
 // ---------------------------------------------------------------------------
 

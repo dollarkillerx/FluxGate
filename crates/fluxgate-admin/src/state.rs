@@ -78,6 +78,9 @@ pub struct AppState {
     pub cf_ranges: Arc<crate::iprange::CidrList>,
     /// IP access control: allow/block lists + auto-ban.
     pub access: Arc<crate::access::AccessControl>,
+    /// Bounds concurrent in-progress ClientHello peeks on the shared :443 ingress
+    /// so a flood of half-open connections can't exhaust memory/fds.
+    pub l4_handshake_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -168,6 +171,7 @@ impl AppState {
             traffic,
             cf_ranges,
             access,
+            l4_handshake_slots: Arc::new(tokio::sync::Semaphore::new(4096)),
         }
     }
 
@@ -183,6 +187,9 @@ pub struct Store {
     pub sites: Vec<Site>,
     pub routes: Vec<Route>,
     pub upstreams: Vec<Upstream>,
+    /// L4 (TLS-SNI passthrough) routes served on the shared :443 ingress.
+    #[serde(default)]
+    pub l4_routes: Vec<L4Route>,
     pub waf_rules: Vec<WafRule>,
     pub certs: Vec<TlsCertificate>,
     pub settings: Settings,

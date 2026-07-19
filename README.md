@@ -12,6 +12,7 @@ through a clean web console (English / 中文 / 日本語).
 ## Features
 
 - 🔁 **Reverse proxy** — sites & path routes, load balancing, WebSocket & streaming
+- 🔀 **L4 / TLS-SNI passthrough** — match a **ClientHello SNI** on the shared `:443` and forward the raw TCP stream **verbatim** to an origin, **never terminating TLS** — so TLS and the app protocol stay end-to-end (VLESS-**Reality**, **AnyTLS**, or any opaque-TLS backend). Exact **and** one-label wildcard (`*.example.com`) SNI rules, origins load-balanced (round-robin / least-conn / IP-hash). Any SNI that matches no L4 route **falls through to the normal L7 HTTPS proxy**, so L4 and L7 coexist on **one port**. Managed from the **L4** console page — see [**L4 / TLS-SNI passthrough**](#l4--tls-sni-passthrough)
 - ↪️ **Redirects** — per-site **301 / 302** rules: match a path **exactly** or by **prefix** (`/old*`) and send visitors to a full URL or a `/path`, answered at the edge before proxying. Plus a one-toggle **HTTP→HTTPS** (308) redirect per site
 - 🛡️ **WAF — semantic, structure-aware** — a **12-module detection engine** that *parses each request's structure* instead of keyword-matching, with **libinjection-grade** SQLi/XSS, plus SSTI / NoSQL / XXE / deserialization / **PHP** & **Java-OGNL/SpEL** injection and **HTTP request-smuggling** — catching evasions with **far fewer false positives**. CRS-style **anomaly scoring**, **per-route monitor/block** mode, one-click **false-positive → exception**. A thin regex layer keeps IP (IPv4 **+ IPv6**) / path / method / geo / rate-limit / **body** policy rules + virtual patching; managed human-verification challenge; per-IP admin **brute-force lockout**. Inspects request line, headers **_and_** body — see [**Web Application Firewall**](#web-application-firewall)
 - 🌍 **Per-site access control** — block by **country** (GeoIP), block **datacenter / cloud IPs** (ASN ≈ "residential only"), accept **only Cloudflare** traffic, or **browser-only** (User-Agent allow-list). Bound to the site and enforced **even when the WAF is off**; Cloudflare-aware (`CF-Connecting-IP`)
@@ -75,6 +76,34 @@ server in a second terminal — `cd web && npm run dev` — and open
 **`http://localhost:5173/`**; it proxies `/rpc` and `/health` to the backend.
 GeoIP / ASN databases auto-download on first start (or set `FLUXGATE_GEOIP_DB`
 / `FLUXGATE_ASN_DB`).
+
+## L4 / TLS-SNI passthrough
+
+Most routes in FluxGate are **L7**: it terminates TLS, inspects the HTTP request,
+runs the WAF, and proxies to an upstream. Some backends can't be terminated —
+they run their **own** TLS on top of a raw TCP stream (VLESS-Reality, AnyTLS, a
+private mTLS service). For those, FluxGate offers **L4 passthrough**.
+
+An **L4 route** claims one or more **SNI** names. On the shared `:443` ingress
+FluxGate peeks *only* the TLS **ClientHello** — just enough to read the SNI, never
+decrypting — then:
+
+- **SNI matches an L4 route** → the ClientHello (byte-for-byte) **and** the rest of
+  the connection are spliced straight through to the selected origin. TLS is
+  **never terminated**; the client and origin do a normal end-to-end handshake.
+- **SNI matches nothing** → the peeked bytes are replayed into the **normal L7
+  HTTPS proxy** (WAF, ACME, routing). Nothing is lost.
+
+So L4 and L7 **share port 443** — no second listener, no port juggling.
+
+Matching is **exact first, then the most-specific one-label wildcard**
+(`*.example.com` matches `a.example.com`, but not the apex or `a.b.example.com`).
+Each route lists one or more `host:port` **origins**, load-balanced by
+**round-robin / least-conn / IP-hash** (IP-hash keeps a client pinned to one
+origin — handy for stateful TLS protocols), with a configurable connect timeout.
+
+Manage it all on the **L4** page of the console (or the `l4route.*` RPC methods):
+give the route a name, the SNI(s), the origin(s), a strategy, and toggle it on.
 
 ## Web Application Firewall
 

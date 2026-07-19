@@ -226,26 +226,36 @@ pub async fn serve_tls(
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(_) => return, // handshake failure (e.g. no cert for SNI) — drop quietly
-            };
-            let io = TokioIo::new(tls_stream);
-            let svc = service_fn(move |req: hyper::Request<Incoming>| {
-                // Convert hyper's incoming body to an axum body and attach peer info.
-                let (parts, body) = req.into_parts();
-                let mut req = hyper::Request::from_parts(parts, axum::body::Body::new(body));
-                req.extensions_mut().insert(ConnectInfo(peer));
-                req.extensions_mut().insert(TlsConn);
-                app.clone().oneshot(req)
-            });
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, svc)
-                .with_upgrades()
-                .await
-            {
-                tracing::debug!("tls connection from {peer} ended: {e}");
-            }
+            serve_tls_connection(app, stream, peer, acceptor).await;
         });
+    }
+}
+
+/// Terminate TLS on one already-accepted stream and serve it via the per-connection
+/// hyper HTTP/1 service. Split out of `serve_tls` so the shared :443 L4 ingress can
+/// replay a peeked ClientHello into the exact same L7 path for non-L4 SNIs.
+pub async fn serve_tls_connection<S>(app: Router, stream: S, peer: SocketAddr, acceptor: TlsAcceptor)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let tls_stream = match acceptor.accept(stream).await {
+        Ok(s) => s,
+        Err(_) => return, // handshake failure (e.g. no cert for SNI) — drop quietly
+    };
+    let io = TokioIo::new(tls_stream);
+    let svc = service_fn(move |req: hyper::Request<Incoming>| {
+        // Convert hyper's incoming body to an axum body and attach peer info.
+        let (parts, body) = req.into_parts();
+        let mut req = hyper::Request::from_parts(parts, axum::body::Body::new(body));
+        req.extensions_mut().insert(ConnectInfo(peer));
+        req.extensions_mut().insert(TlsConn);
+        app.clone().oneshot(req)
+    });
+    if let Err(e) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, svc)
+        .with_upgrades()
+        .await
+    {
+        tracing::debug!("tls connection from {peer} ended: {e}");
     }
 }

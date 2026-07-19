@@ -85,6 +85,23 @@ export interface Upstream {
   tls?: boolean
 }
 
+/** An L4 (TLS-SNI passthrough) route: matches a ClientHello SNI on :443 and
+ *  forwards the byte stream verbatim to an origin (never terminating TLS). */
+export interface L4Route {
+  id: string
+  name: string
+  /** SNI names claimed: exact ("a.example.com") or one-label wildcard ("*.example.com"). */
+  server_names: string[]
+  /** Origin "host:port" TCP targets, load-balanced by strategy. */
+  origins: string[]
+  strategy: LbStrategy
+  /** Origin connect timeout (seconds); 0 = default (5s). */
+  connect_timeout_secs: number
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
 export type WafAction = 'allow' | 'deny' | 'challenge'
 export type WafMatchType = 'ip' | 'path' | 'header' | 'method' | 'geo' | 'rate_limit' | 'body'
 

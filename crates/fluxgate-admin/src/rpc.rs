@@ -595,6 +595,79 @@ fn dispatch(state: &AppState, method: &str, params: Value) -> RpcResult {
         "route.enable" => set_route_enabled(&mut store, params, true),
         "route.disable" => set_route_enabled(&mut store, params, false),
 
+        // ---- L4 (TLS-SNI passthrough) routes ----
+        "l4route.list" => ok(&store.l4_routes),
+        "l4route.get" => {
+            let p: IdParam = parse(params)?;
+            store
+                .l4_routes
+                .iter()
+                .find(|r| r.id == p.id)
+                .map(ok_ref)
+                .unwrap_or_else(|| Err(RpcError::not_found(format!("l4 route {}", p.id))))
+        }
+        "l4route.create" => {
+            let input: L4RouteInput = parse(params)?;
+            let now = Utc::now().to_rfc3339();
+            let route = L4Route {
+                id: short_id("l4"),
+                name: input.name.unwrap_or_default(),
+                server_names: input.server_names.unwrap_or_default(),
+                origins: input.origins.unwrap_or_default(),
+                strategy: input.strategy.unwrap_or(LbStrategy::RoundRobin),
+                connect_timeout_secs: input.connect_timeout_secs.unwrap_or(0),
+                enabled: input.enabled.unwrap_or(true),
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            store.l4_routes.insert(0, route.clone());
+            audit("l4route.create", &route.id);
+            ok(route)
+        }
+        "l4route.update" => {
+            let input: L4RouteInput = parse(params)?;
+            let id = require_id(&input.id)?;
+            let r = store
+                .l4_routes
+                .iter_mut()
+                .find(|r| r.id == id)
+                .ok_or_else(|| RpcError::not_found(format!("l4 route {id}")))?;
+            if let Some(v) = input.name {
+                r.name = v;
+            }
+            if let Some(v) = input.server_names {
+                r.server_names = v;
+            }
+            if let Some(v) = input.origins {
+                r.origins = v;
+            }
+            if let Some(v) = input.strategy {
+                r.strategy = v;
+            }
+            if let Some(v) = input.connect_timeout_secs {
+                r.connect_timeout_secs = v;
+            }
+            if let Some(v) = input.enabled {
+                r.enabled = v;
+            }
+            r.updated_at = Utc::now().to_rfc3339();
+            let out = r.clone();
+            audit("l4route.update", &id);
+            ok(out)
+        }
+        "l4route.delete" => {
+            let p: IdParam = parse(params)?;
+            let before = store.l4_routes.len();
+            store.l4_routes.retain(|r| r.id != p.id);
+            if store.l4_routes.len() == before {
+                return Err(RpcError::not_found(format!("l4 route {}", p.id)));
+            }
+            audit("l4route.delete", &p.id);
+            ok(json!({ "success": true, "id": p.id }))
+        }
+        "l4route.enable" => set_l4route_enabled(&mut store, params, true),
+        "l4route.disable" => set_l4route_enabled(&mut store, params, false),
+
         // ---- Upstreams ----
         "upstream.list" => ok(&store.upstreams),
         "upstream.get" => {
@@ -1187,6 +1260,27 @@ fn set_route_enabled(store: &mut crate::state::Store, params: Value, enabled: bo
     ok(out)
 }
 
+fn set_l4route_enabled(store: &mut crate::state::Store, params: Value, enabled: bool) -> RpcResult {
+    let p: IdParam = parse(params)?;
+    let r = store
+        .l4_routes
+        .iter_mut()
+        .find(|r| r.id == p.id)
+        .ok_or_else(|| RpcError::not_found(format!("l4 route {}", p.id)))?;
+    r.enabled = enabled;
+    r.updated_at = Utc::now().to_rfc3339();
+    let out = r.clone();
+    audit(
+        if enabled {
+            "l4route.enable"
+        } else {
+            "l4route.disable"
+        },
+        &p.id,
+    );
+    ok(out)
+}
+
 fn set_rule_enabled(store: &mut crate::state::Store, params: Value, enabled: bool) -> RpcResult {
     let p: IdParam = parse(params)?;
     let r = store
@@ -1510,6 +1604,17 @@ struct UpstreamInput {
     servers: Option<Vec<UpstreamServer>>,
     /// Connect to this upstream over TLS (`https://`). See `Upstream.tls`.
     tls: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct L4RouteInput {
+    id: Option<String>,
+    name: Option<String>,
+    server_names: Option<Vec<String>>,
+    origins: Option<Vec<String>>,
+    strategy: Option<LbStrategy>,
+    connect_timeout_secs: Option<u64>,
+    enabled: Option<bool>,
 }
 
 /// Normalise an upstream server address to bare `host:port`: drop any `http(s)://`

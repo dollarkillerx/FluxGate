@@ -131,6 +131,7 @@ pub fn empty_store() -> Store {
         sites: Vec::new(),
         routes: Vec::new(),
         upstreams: Vec::new(),
+        l4_routes: Vec::new(),
         // Ship the full built-in ruleset out of the box (baseline + OWASP CRS).
         waf_rules: seed_waf_rules(),
         certs: Vec::new(),

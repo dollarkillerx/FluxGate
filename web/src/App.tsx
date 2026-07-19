@@ -6,6 +6,7 @@ import { Dashboard } from '@/pages/Dashboard'
 import { RoutesPage } from '@/pages/RoutesPage'
 import { RouteAnalyticsPage } from '@/pages/RouteAnalyticsPage'
 import { UpstreamsPage } from '@/pages/UpstreamsPage'
+import { L4RoutesPage } from '@/pages/L4RoutesPage'
 import { WafRulesPage } from '@/pages/WafRulesPage'
 import { RiskPage } from '@/pages/RiskPage'
 import { AccessPage } from '@/pages/AccessPage'
@@ -27,6 +28,7 @@ export default function App() {
         <Route path="/routes" element={<RoutesPage />} />
         <Route path="/routes/analytics" element={<RouteAnalyticsPage />} />
         <Route path="/upstreams" element={<UpstreamsPage />} />
+        <Route path="/l4" element={<L4RoutesPage />} />
         <Route path="/waf" element={<WafRulesPage />} />
         <Route path="/risk" element={<RiskPage />} />
         <Route path="/access" element={<AccessPage />} />

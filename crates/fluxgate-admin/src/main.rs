@@ -30,6 +30,7 @@ mod challenge;
 mod cloudflare;
 mod collector;
 mod iprange;
+mod l4;
 mod pages;
 mod persist;
 mod proxy;
@@ -135,8 +136,10 @@ async fn main() -> anyhow::Result<()> {
         let tls_state = state.clone();
         tokio::spawn(async move {
             let cfg = serve::data_plane_config(tls_state.clone());
-            tracing::info!("  • Proxy   : https://{tls_addr} (SNI: serves only configured + TLS-enabled hosts)");
-            if let Err(e) = serve::serve_tls(proxy::router(tls_state), tls_addr, cfg).await {
+            // Shared :443 ingress: L4 SNI-passthrough routes forward verbatim, every
+            // other SNI falls through to the L7 HTTPS proxy (cert + tls_enabled site).
+            let app = proxy::router(tls_state.clone());
+            if let Err(e) = l4::run_shared(tls_state, app, tls_addr, cfg).await {
                 tracing::error!(
                     "proxy HTTPS plane failed to start on {tls_addr}: {e}{}",
                     bind_hint(&e, tls_addr)

@@ -1925,6 +1925,7 @@ mod tests {
                 .collect(),
             healthy_servers: 0,
             status: UpstreamStatus::Down,
+            tls: false,
         };
         u.recompute_health();
         u
