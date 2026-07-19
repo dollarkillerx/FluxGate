@@ -81,7 +81,7 @@ GeoIP / ASN databases auto-download on first start (or set `FLUXGATE_GEOIP_DB`
 
 Most routes in FluxGate are **L7**: it terminates TLS, inspects the HTTP request,
 runs the WAF, and proxies to an upstream. Some backends can't be terminated —
-they run their **own** TLS on top of a raw TCP stream (VLESS-Reality, AnyTLS, a
+they run their **own** TLS on top of a raw TCP stream (a
 private mTLS service). For those, FluxGate offers **L4 passthrough**.
 
 An **L4 route** claims one or more **SNI** names. On the shared `:443` ingress
