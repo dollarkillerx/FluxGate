@@ -180,21 +180,26 @@ fn spawn_background_tasks(state: AppState) {
         }
     });
 
-    // Upstream TCP health probing.
+    // Upstream TCP health probing. The store lock is on the data plane's hot
+    // path (routing, TLS-SNI cert lookup, L4 route lookup), so the probes —
+    // blocking DNS + connects that cost the full timeout per dead node — must
+    // never run under it: snapshot the addresses, probe unlocked on a blocking
+    // thread, then re-lock only to write the results back.
     let store = state.store.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(10));
         loop {
             ticker.tick().await;
-            // Blocking connects run on a dedicated thread to avoid stalling the runtime.
-            let store = store.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                let mut s = store.lock();
-                collector::probe_upstreams(&mut s);
-            })
-            .await
-            {
-                tracing::warn!("upstream health probe task failed: {e}");
+            let addrs: Vec<String> = {
+                let s = store.lock();
+                s.upstreams
+                    .iter()
+                    .flat_map(|u| u.servers.iter().map(|srv| srv.address.clone()))
+                    .collect()
+            };
+            match tokio::task::spawn_blocking(move || collector::probe_addresses(&addrs)).await {
+                Ok(results) => collector::apply_probe_results(&mut store.lock(), &results),
+                Err(e) => tracing::warn!("upstream health probe task failed: {e}"),
             }
         }
     });
@@ -243,22 +248,12 @@ fn spawn_background_tasks(state: AppState) {
         let mut ticker = tokio::time::interval(Duration::from_secs(3600));
         loop {
             ticker.tick().await;
-            let (logs, events) = (logs.clone(), events.clone());
-            // File rewrite is blocking IO — keep it off the async runtime.
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                let cutoff = Utc::now() - chrono::Duration::days(retention_days);
-                let removed_logs = logs.lock().prune_older_than(cutoff);
-                let removed_events = events.lock().prune_older_than(cutoff);
-                if removed_logs > 0 || removed_events > 0 {
-                    tracing::info!(
-                        "retention: pruned {removed_logs} access-log + {removed_events} event entries older than {retention_days}d"
-                    );
-                }
-            })
-            .await
-            {
-                tracing::warn!("log retention task failed: {e}");
-            }
+            let cutoff = Utc::now() - chrono::Duration::days(retention_days);
+            // Cheap under the lock: only the in-memory ring is pruned here. The
+            // on-disk JSONL rewrite is queued onto each buffer's writer thread,
+            // so requests logging through these locks never wait on it.
+            logs.lock().prune_older_than(cutoff);
+            events.lock().prune_older_than(cutoff);
         }
     });
 

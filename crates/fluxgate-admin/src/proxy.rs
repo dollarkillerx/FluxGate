@@ -91,6 +91,9 @@ impl rustls::client::danger::ServerCertVerifier for NoUpstreamCertVerify {
 pub fn build_client() -> ProxyClient {
     let mut http = HttpConnector::new();
     http.set_nodelay(true);
+    // Bound the TCP connect separately from the per-site overall timeout, so a
+    // blackholed node fails over in seconds instead of eating the full 30s.
+    http.set_connect_timeout(Some(Duration::from_secs(5)));
     http.enforce_http(false); // let https:// URLs reach the TLS layer
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let tls = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -104,7 +107,14 @@ pub fn build_client() -> ProxyClient {
         .https_or_http()
         .enable_http1()
         .wrap_connector(http);
-    Client::builder(TokioExecutor::new()).build(https)
+    Client::builder(TokioExecutor::new())
+        // Expire idle pooled connections BEFORE common upstream keep-alive
+        // timeouts (nginx 75s; some app servers less) so we don't grab a
+        // connection the upstream is about to close — a race that surfaces as
+        // sporadic failed/retried requests. Needs a pool timer to take effect.
+        .pool_idle_timeout(Duration::from_secs(50))
+        .pool_timer(hyper_util::rt::TokioTimer::new())
+        .build(https)
 }
 
 /// Hop-by-hop headers stripped on normal (non-upgrade) forwarding.
@@ -175,6 +185,9 @@ pub async fn run(state: AppState, addr: SocketAddr) -> std::io::Result<()> {
         listener,
         router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
+    // Client-facing leg: avoid Nagle/delayed-ACK stalls on small responses
+    // (the TLS listeners set nodelay at accept; this covers the :80 plane).
+    .tcp_nodelay(true)
     .await
 }
 

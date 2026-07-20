@@ -9,10 +9,12 @@
 //! data plane (WAF hits, security events) are reported as empty/zero rather than
 //! invented.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -46,6 +48,98 @@ fn warn_on_log_write(what: &str, res: std::io::Result<()>, was_ok: bool) -> bool
             }
             false
         }
+    }
+}
+
+/// Command for a [`JsonlWriter`]'s thread: append one line, or run the
+/// retention rewrite.
+enum WriterCmd {
+    Line(String),
+    Prune(DateTime<Utc>),
+}
+
+/// Owns a JSONL file on a dedicated thread. The data plane hands finished lines
+/// over a bounded channel and never touches the disk itself, so a stalled/busy
+/// disk — or the hourly retention rewrite of the same file — can no longer add
+/// latency to request handling (the buffer mutex used to be held across a
+/// synchronous `write(2)` per request, serialising every request behind disk
+/// I/O). Appends and the retention rewrite run on the one thread, so they can't
+/// interleave and lose lines.
+///
+/// When the channel is full the line is dropped and counted: losing log lines
+/// while the disk is stalled beats stalling every in-flight request.
+pub struct JsonlWriter {
+    what: &'static str,
+    tx: SyncSender<WriterCmd>,
+    dropped: AtomicU64,
+}
+
+impl JsonlWriter {
+    /// ~300 B/line → a full channel buffers ~2.5 MB before lines are dropped.
+    const QUEUE: usize = 8192;
+
+    pub fn spawn(what: &'static str, path: PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(Self::QUEUE);
+        let _ = std::thread::Builder::new()
+            .name(format!("jsonl-{what}"))
+            .spawn(move || {
+                // O_APPEND keeps this handle valid across the in-place retention
+                // rewrite (writes always land at the current end of file).
+                let mut file = open_append(&path);
+                let mut write_ok = true;
+                for cmd in rx {
+                    match cmd {
+                        WriterCmd::Line(line) => {
+                            if let Some(f) = file.as_mut() {
+                                let res = writeln!(f, "{line}");
+                                write_ok = warn_on_log_write(what, res, write_ok);
+                            }
+                        }
+                        WriterCmd::Prune(cutoff) => {
+                            let removed = prune_jsonl_by_time(&path, cutoff);
+                            if removed > 0 {
+                                tracing::info!(
+                                    "retention: pruned {removed} {what} entries from disk"
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        Self {
+            what,
+            tx,
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Queue one already-serialised line (non-blocking; drops when stalled).
+    pub fn line(&self, line: String) {
+        match self.tx.try_send(WriterCmd::Line(line)) {
+            Ok(()) => {
+                let dropped = self.dropped.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    tracing::warn!(
+                        "{} writer caught up — {dropped} entries were dropped while it was stalled",
+                        self.what
+                    );
+                }
+            }
+            Err(_) => {
+                if self.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::warn!(
+                        "{} writer stalled (disk busy?) — dropping entries until it drains",
+                        self.what
+                    );
+                }
+            }
+        }
+    }
+
+    /// Queue the on-disk retention rewrite. Best effort: if the writer is
+    /// stalled the next hourly pass retries.
+    pub fn prune(&self, cutoff: DateTime<Utc>) {
+        let _ = self.tx.try_send(WriterCmd::Prune(cutoff));
     }
 }
 
@@ -194,9 +288,9 @@ pub struct LogBuffer {
     entries: VecDeque<AccessLog>, // newest first
     total: u64,
     cap: usize,
-    path: Option<PathBuf>,
-    file: Option<std::fs::File>, // long-lived O_APPEND handle
-    write_ok: bool,              // false after a write failed (warn once per streak)
+    /// Dedicated persistence thread — this mutex-guarded buffer never does disk
+    /// I/O itself (the data plane locks it on every request).
+    writer: Option<JsonlWriter>,
 }
 
 impl LogBuffer {
@@ -206,23 +300,20 @@ impl LogBuffer {
             Some(p) => load_jsonl::<AccessLog>(p, cap),
             None => (0, VecDeque::new()),
         };
-        let file = path.as_ref().and_then(open_append);
+        let writer = path.map(|p| JsonlWriter::spawn("access-log", p));
         Self {
             entries,
             total,
             cap,
-            path,
-            file,
-            write_ok: true,
+            writer,
         }
     }
 
     pub fn record(&mut self, entry: AccessLog) {
         self.total += 1;
-        if let Some(f) = self.file.as_mut() {
+        if let Some(w) = &self.writer {
             if let Ok(line) = serde_json::to_string(&entry) {
-                let res = writeln!(f, "{line}");
-                self.write_ok = warn_on_log_write("access-log", res, self.write_ok);
+                w.line(line);
             }
         }
         self.entries.push_front(entry);
@@ -240,15 +331,14 @@ impl LogBuffer {
         self.entries.iter().cloned().collect()
     }
 
-    /// Drop entries older than `cutoff` from memory and the on-disk JSONL.
-    /// Returns the number of disk lines removed.
-    pub fn prune_older_than(&mut self, cutoff: DateTime<Utc>) -> u64 {
+    /// Drop entries older than `cutoff` from memory, and queue the on-disk JSONL
+    /// rewrite onto the writer thread (so no request waits on the file rewrite).
+    pub fn prune_older_than(&mut self, cutoff: DateTime<Utc>) {
         self.entries
             .retain(|e| parse(&e.time).map(|t| t >= cutoff).unwrap_or(true));
-        self.path
-            .as_ref()
-            .map(|p| prune_jsonl_by_time(p, cutoff))
-            .unwrap_or(0)
+        if let Some(w) = &self.writer {
+            w.prune(cutoff);
+        }
     }
 }
 
@@ -296,9 +386,8 @@ pub struct EventBuffer {
     total_deny: u64,
     total_challenge: u64,
     cap: usize,
-    path: Option<PathBuf>,
-    file: Option<std::fs::File>, // long-lived O_APPEND handle
-    write_ok: bool,
+    /// Dedicated persistence thread (see [`LogBuffer::writer`]).
+    writer: Option<JsonlWriter>,
 }
 
 impl EventBuffer {
@@ -324,15 +413,13 @@ impl EventBuffer {
             }
             None => VecDeque::new(),
         };
-        let file = path.as_ref().and_then(open_append);
+        let writer = path.map(|p| JsonlWriter::spawn("waf-event", p));
         Self {
             entries,
             total_deny,
             total_challenge,
             cap,
-            path,
-            file,
-            write_ok: true,
+            writer,
         }
     }
 
@@ -342,10 +429,9 @@ impl EventBuffer {
             WafAction::Challenge => self.total_challenge += 1,
             WafAction::Allow => {}
         }
-        if let Some(f) = self.file.as_mut() {
+        if let Some(w) = &self.writer {
             if let Ok(line) = serde_json::to_string(&event) {
-                let res = writeln!(f, "{line}");
-                self.write_ok = warn_on_log_write("waf-event", res, self.write_ok);
+                w.line(line);
             }
         }
         self.entries.push_front(event);
@@ -367,15 +453,14 @@ impl EventBuffer {
         &self.entries
     }
 
-    /// Drop events older than `cutoff` from memory and the on-disk JSONL.
-    /// Returns the number of disk lines removed.
-    pub fn prune_older_than(&mut self, cutoff: DateTime<Utc>) -> u64 {
+    /// Drop events older than `cutoff` from memory, and queue the on-disk JSONL
+    /// rewrite onto the writer thread (so no request waits on the file rewrite).
+    pub fn prune_older_than(&mut self, cutoff: DateTime<Utc>) {
         self.entries
             .retain(|e| parse(&e.time).map(|t| t >= cutoff).unwrap_or(true));
-        self.path
-            .as_ref()
-            .map(|p| prune_jsonl_by_time(p, cutoff))
-            .unwrap_or(0)
+        if let Some(w) = &self.writer {
+            w.prune(cutoff);
+        }
     }
 }
 
@@ -892,18 +977,52 @@ mod retention_tests {
 // Real upstream TCP health probing
 // ---------------------------------------------------------------------------
 
-/// TCP-connect to every upstream server, updating `healthy`/`latency_ms`.
-pub fn probe_upstreams(store: &mut Store) {
+const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Probe each distinct address once (blocking DNS resolution + TCP connect).
+/// Must run WITHOUT the store lock held: a dead/firewalled node costs the full
+/// connect timeout and a hostname adds a DNS round-trip, while the store lock
+/// sits on the data plane's routing, TLS-SNI and L4 lookup paths — holding it
+/// across probes stalls every in-flight request for the duration.
+pub fn probe_addresses(addrs: &[String]) -> HashMap<String, Option<u32>> {
+    let mut results: HashMap<String, Option<u32>> = HashMap::with_capacity(addrs.len());
+    for a in addrs {
+        if !results.contains_key(a) {
+            results.insert(a.clone(), probe_one(a, PROBE_TIMEOUT));
+        }
+    }
+    results
+}
+
+/// Write a probe sweep's results back onto the store's upstreams (the caller
+/// holds the lock only for this). A node added after the address snapshot keeps
+/// its current state until the next sweep.
+pub fn apply_probe_results(store: &mut Store, results: &HashMap<String, Option<u32>>) {
     for up in &mut store.upstreams {
-        probe_one_upstream(up);
+        for srv in &mut up.servers {
+            match results.get(&srv.address) {
+                Some(Some(ms)) => {
+                    srv.healthy = true;
+                    srv.latency_ms = *ms;
+                }
+                Some(None) => {
+                    srv.healthy = false;
+                    srv.latency_ms = 0;
+                }
+                None => {}
+            }
+        }
+        up.recompute_health();
     }
 }
 
-/// Probe a single upstream's nodes.
+/// Probe a single upstream's nodes. Used by the admin RPCs (create/update/
+/// health) where an immediate answer for one upstream is wanted; the periodic
+/// sweep uses `probe_addresses` + `apply_probe_results` so it never probes
+/// under the store lock.
 pub fn probe_one_upstream(up: &mut Upstream) {
-    let timeout = Duration::from_millis(800);
     for srv in &mut up.servers {
-        match probe_one(&srv.address, timeout) {
+        match probe_one(&srv.address, PROBE_TIMEOUT) {
             Some(ms) => {
                 srv.healthy = true;
                 srv.latency_ms = ms;

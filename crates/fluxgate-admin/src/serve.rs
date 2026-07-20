@@ -223,6 +223,10 @@ pub async fn serve_tls(
                 continue;
             }
         };
+        // Nagle + delayed-ACK adds 40–200 ms stalls to the multi-flight TLS
+        // handshake and to small/chunked responses; the upstream leg already
+        // sets nodelay, this is the client-facing leg.
+        let _ = stream.set_nodelay(true);
         let acceptor = acceptor.clone();
         let app = app.clone();
         tokio::spawn(async move {

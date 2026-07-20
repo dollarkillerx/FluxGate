@@ -409,6 +409,9 @@ pub async fn run_shared(
     tracing::info!("  • Ingress : tls://{addr} (shared HTTPS + L4 SNI passthrough)");
     loop {
         let (stream, peer) = accept_resilient(&listener).await;
+        // Client-facing leg: without nodelay, Nagle + delayed-ACK stalls the
+        // TLS handshake flights and small responses (the origin legs set it).
+        let _ = stream.set_nodelay(true);
         let Ok(permit) = state.l4_handshake_slots.clone().try_acquire_owned() else {
             tracing::warn!(%peer, "shared ingress ClientHello concurrency limit reached");
             continue;
