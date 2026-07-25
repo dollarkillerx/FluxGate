@@ -159,7 +159,9 @@ fn parse_client_hello(raw: &[u8]) -> Result<ParseResult, L4Error> {
             return Ok(ParseResult::NeedMore);
         }
         if raw[record_at] != 22 {
-            return Err(L4Error::InvalidHello("first flight is not TLS handshake data"));
+            return Err(L4Error::InvalidHello(
+                "first flight is not TLS handshake data",
+            ));
         }
         let record_len = u16::from_be_bytes([raw[record_at + 3], raw[record_at + 4]]) as usize;
         if record_len > 18_432 {
@@ -176,7 +178,9 @@ fn parse_client_hello(raw: &[u8]) -> Result<ParseResult, L4Error> {
             continue;
         }
         if handshake[0] != 1 {
-            return Err(L4Error::InvalidHello("first handshake message is not ClientHello"));
+            return Err(L4Error::InvalidHello(
+                "first handshake message is not ClientHello",
+            ));
         }
         let hello_len = ((handshake[1] as usize) << 16)
             | ((handshake[2] as usize) << 8)
@@ -253,7 +257,12 @@ fn parse_server_name_extension(ext: &[u8]) -> Result<String, L4Error> {
     Err(L4Error::MissingSni)
 }
 
-fn checked_advance(bytes: &[u8], at: usize, len: usize, field: &'static str) -> Result<usize, L4Error> {
+fn checked_advance(
+    bytes: &[u8],
+    at: usize,
+    len: usize,
+    field: &'static str,
+) -> Result<usize, L4Error> {
     let end = at
         .checked_add(len)
         .ok_or(L4Error::InvalidHello("length overflow"))?;
@@ -280,7 +289,9 @@ fn normalize_server_name(name: &str) -> Option<String> {
                 || label.len() > 63
                 || label.starts_with('-')
                 || label.ends_with('-')
-                || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
     {
         None
@@ -366,16 +377,23 @@ pub async fn serve_passthrough(
     } else {
         route.connect_timeout_secs.clamp(1, 60)
     };
-    let mut origin = tokio::time::timeout(Duration::from_secs(secs), TcpStream::connect(&origin_addr))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "L4 origin connect timed out"))??;
+    let mut origin =
+        tokio::time::timeout(Duration::from_secs(secs), TcpStream::connect(&origin_addr))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "L4 origin connect timed out")
+            })??;
     origin.set_nodelay(true).ok();
-    let PeekedStream {
-        mut stream, prefix, ..
-    } = peeked;
+    let PeekedStream { stream, prefix, .. } = peeked;
     origin.write_all(&prefix).await?;
-    tokio::io::copy_bidirectional(&mut stream, &mut origin).await?;
-    Ok(())
+    let mut stream = crate::serve::IdleTimeoutIo::new(stream, crate::serve::HTTP_IDLE_TIMEOUT);
+    let mut origin = crate::serve::IdleTimeoutIo::new(origin, crate::serve::HTTP_IDLE_TIMEOUT);
+    let result = tokio::io::copy_bidirectional(&mut stream, &mut origin)
+        .await
+        .map(|_| ());
+    let _ = stream.shutdown().await;
+    let _ = origin.shutdown().await;
+    result
 }
 
 /// accept_resilient wraps `listener.accept()` so a PER-CONNECTION accept error
@@ -570,7 +588,10 @@ mod tests {
     #[test]
     fn match_is_case_and_trailing_dot_insensitive() {
         let routes = vec![route("r", &["API.Example.COM."], true)];
-        assert_eq!(match_l4_route(&routes, "api.example.com").unwrap().name, "r");
+        assert_eq!(
+            match_l4_route(&routes, "api.example.com").unwrap().name,
+            "r"
+        );
     }
 
     #[test]

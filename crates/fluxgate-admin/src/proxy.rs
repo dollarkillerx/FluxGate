@@ -36,6 +36,7 @@ use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Bytes, Frame};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::io::AsyncWriteExt;
 
 use fluxgate_core::*;
 
@@ -112,8 +113,9 @@ pub fn build_client() -> ProxyClient {
         // timeouts (nginx 75s; some app servers less) so we don't grab a
         // connection the upstream is about to close — a race that surfaces as
         // sporadic failed/retried requests. Needs a pool timer to take effect.
-        .pool_idle_timeout(Duration::from_secs(50))
+        .pool_idle_timeout(Duration::from_secs(30))
         .pool_timer(hyper_util::rt::TokioTimer::new())
+        .pool_max_idle_per_host(32)
         .build(https)
 }
 
@@ -179,16 +181,8 @@ pub fn router(state: AppState) -> Router {
 }
 
 pub async fn run(state: AppState, addr: SocketAddr) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("  • Proxy   : http://{addr}  (reverse proxy: WAF enforcing, WS + streaming)");
-    axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    // Client-facing leg: avoid Nagle/delayed-ACK stalls on small responses
-    // (the TLS listeners set nodelay at accept; this covers the :80 plane).
-    .tcp_nodelay(true)
-    .await
+    crate::serve::serve_http(router(state), addr).await
 }
 
 async fn proxy_handler(
@@ -949,6 +943,8 @@ async fn proxy_handler(
                         let mut c = TokioIo::new(client_io);
                         let mut u = TokioIo::new(upstream_io);
                         let _ = tokio::io::copy_bidirectional(&mut c, &mut u).await;
+                        let _ = c.shutdown().await;
+                        let _ = u.shutdown().await;
                     }
                     _ => tracing::warn!("websocket upgrade bridge failed"),
                 }
