@@ -6,7 +6,8 @@
 //! * **Auto-ban** — when enabled, an IP that trips `threshold` WAF *denies* within
 //!   a 24h window is banned for a configured duration (or permanently). Auto-bans
 //!   are persisted (so a permanent ban survives a restart); the deny-count window
-//!   is in-memory and bounded.
+//!   is in-memory and bounded. Addresses on the never-ban list (Cloudflare edges,
+//!   see [`AccessControl::set_never_ban`]) are exempt.
 //!
 //! Matching reuses the dual-stack [`crate::iprange::CidrList`]. All decisions are
 //! made on the **real client IP** (Cloudflare-aware, unspoofable) supplied by the
@@ -66,6 +67,8 @@ pub struct AccessControl {
     /// Fast path: true while any auto-ban exists, so `is_blocked` can skip the
     /// `bans` lock entirely when none are active.
     has_bans: AtomicBool,
+    /// Addresses that are never auto-banned (Cloudflare edges).
+    never_ban: RwLock<Arc<CidrList>>,
     path: Option<PathBuf>,
 }
 
@@ -86,6 +89,7 @@ impl AccessControl {
             deny_window: Mutex::new(HashMap::new()),
             bans: Mutex::new(bans),
             has_bans: AtomicBool::new(has),
+            never_ban: RwLock::new(Arc::new(CidrList::default())),
             path,
         }
     }
@@ -94,6 +98,27 @@ impl AccessControl {
     pub fn rebuild(&self, whitelist: &[IpListEntry], blacklist: &[IpListEntry]) {
         *self.allow.write() = Arc::new(compile(whitelist));
         *self.block.write() = Arc::new(compile(blacklist));
+    }
+
+    /// Set the addresses that must never be auto-banned, and lift any auto-ban
+    /// already on them. Used for the Cloudflare edge ranges: an edge is the TCP
+    /// peer of every visitor Cloudflare routes through it, so for a CF-fronted site
+    /// without "Only allow Cloudflare" a few bad visitors would get the edge
+    /// banned, and the pre-routing peer check would then refuse that edge on
+    /// every site. Returns how many existing bans were lifted.
+    pub fn set_never_ban(&self, list: Arc<CidrList>) -> usize {
+        let lifted = {
+            let mut bans = self.bans.lock();
+            let before = bans.len();
+            bans.retain(|ip, _| !ip.parse().map(|a| list.contains(a)).unwrap_or(false));
+            self.has_bans.store(!bans.is_empty(), Ordering::Relaxed);
+            before - bans.len()
+        };
+        self.deny_window
+            .lock()
+            .retain(|ip, _| !ip.parse().map(|a| list.contains(a)).unwrap_or(false));
+        *self.never_ban.write() = list;
+        lifted
     }
 
     /// Whether `ip` is fully trusted (skips all blocking).
@@ -123,6 +148,10 @@ impl AccessControl {
     /// permanent) iff a ban was just created — for the caller to log.
     pub fn record_deny(&self, ip: &str, now: i64, cfg: AutoBanCfg) -> Option<i64> {
         if !cfg.enabled || cfg.threshold == 0 {
+            return None;
+        }
+        let never_ban = self.never_ban.read().clone();
+        if !never_ban.is_empty() && ip.parse().map(|a| never_ban.contains(a)).unwrap_or(false) {
             return None;
         }
         // Already banned → just bump its deny tally, don't re-ban.
@@ -306,5 +335,28 @@ mod tests {
         let c = cfg(2, 100);
         ac.record_deny("2.2.2.2", 1000, c);
         assert_eq!(ac.record_deny("2.2.2.2", 1000 + WINDOW_SECS, c), None); // old one pruned
+    }
+
+    #[test]
+    fn never_ban_lifts_existing_bans_and_blocks_new_ones() {
+        let ac = AccessControl::new(None);
+        let c = cfg(1, 0);
+        // Banned before the list is known (e.g. by an older build, from disk).
+        assert_eq!(ac.record_deny("172.70.92.145", 1000, c), Some(0));
+        assert_eq!(ac.record_deny("2a06:98c0:3600::103", 1000, c), Some(0));
+        assert_eq!(ac.record_deny("9.9.9.9", 1000, c), Some(0));
+        let edges = CidrList::parse_lines("172.64.0.0/13\n2a06:98c0::/29");
+        assert_eq!(ac.set_never_ban(Arc::new(edges)), 2);
+        assert!(!ac.is_blocked(ip("172.70.92.145"), 1000));
+        assert!(!ac.is_blocked(ip("2a06:98c0:3600::103"), 1000));
+        assert!(ac.is_blocked(ip("9.9.9.9"), 1000)); // others keep their ban
+                                                     // An edge is never banned again, however many denies it collects.
+        for t in 0..10 {
+            assert_eq!(ac.record_deny("172.70.92.145", 2000 + t, c), None);
+        }
+        assert!(!ac.is_blocked(ip("172.70.92.145"), 3000));
+        // The manual block-list still applies to an edge (operator's explicit choice).
+        ac.rebuild(&[], &[entry("172.70.92.145")]);
+        assert!(ac.is_blocked(ip("172.70.92.145"), 3000));
     }
 }

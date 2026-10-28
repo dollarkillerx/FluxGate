@@ -152,6 +152,12 @@ impl AppState {
         let cf_ranges = Arc::new(crate::cloudflare::load());
         let access = Arc::new(crate::access::AccessControl::new(config.bans_path.clone()));
         access.rebuild(&store.ip_whitelist, &store.ip_blacklist);
+        // Cloudflare edges are shared by all their visitors: never auto-ban one, and
+        // lift edge bans left by older builds (they blocked that edge on every site).
+        let lifted = access.set_never_ban(cf_ranges.clone());
+        if lifted > 0 {
+            tracing::warn!(target: "fluxgate::audit", lifted, "lifted auto-bans on Cloudflare edge addresses");
+        }
         Self {
             config: Arc::new(config),
             store: Arc::new(Mutex::new(store)),
